@@ -2,7 +2,7 @@ import os
 import json
 import random
 import asyncio
-import pandas as pd
+import csv
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import aiohttp
@@ -73,7 +73,7 @@ class QuizBot:
                     "📝 **Add Quiz** - Add new quizzes to the database\n"
                     "📢 **Broadcast** - Send message to all groups\n"
                     "👥 **Manage Groups** - View and manage groups\n"
-                    "📋 **Export Data** - Export quizzes and stats to Excel\n\n"
+                    "📋 **Export Data** - Export quizzes and stats\n\n"
                     "You can also simply send me any message to add it as a quiz!",
                     reply_markup=reply_markup
                 )
@@ -261,7 +261,7 @@ class QuizBot:
         )
         
         keyboard = [
-            [InlineKeyboardButton("📋 Export Excel", callback_data="export_data")],
+            [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
         ]
@@ -334,7 +334,7 @@ class QuizBot:
         await update.message.reply_text(report)
     
     async def export_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Export bot data to Excel"""
+        """Export bot data to JSON and CSV files"""
         user_id = update.effective_user.id
         
         if user_id != ADMIN_USER_ID:
@@ -342,32 +342,66 @@ class QuizBot:
             return
         
         try:
-            # Create Excel file with multiple sheets
-            with pd.ExcelWriter('bot_data.xlsx', engine='openpyxl') as writer:
-                # Quizzes sheet
-                quizzes_df = pd.DataFrame(self.quizzes)
-                if not quizzes_df.empty:
-                    quizzes_df.to_excel(writer, sheet_name='Quizzes', index=False)
+            # Export quizzes to CSV
+            if self.quizzes:
+                with open('quizzes_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
+                    fieldnames = ['id', 'text', 'added_date', 'sent_count', 'last_sent', 'engagement']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for quiz in self.quizzes:
+                        writer.writerow(quiz)
                 
-                # Groups sheet
-                groups_df = pd.DataFrame(self.groups)
-                if not groups_df.empty:
-                    groups_df.to_excel(writer, sheet_name='Groups', index=False)
-                
-                # Stats sheet
-                stats_df = pd.DataFrame([self.stats])
-                stats_df.to_excel(writer, sheet_name='Statistics', index=False)
+                # Send quizzes CSV
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=open('quizzes_export.csv', 'rb'),
+                    filename='quizzes_export.csv',
+                    caption="📝 Quizzes Export (CSV)"
+                )
             
-            # Send file to admin
+            # Export groups to CSV
+            if self.groups:
+                with open('groups_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
+                    fieldnames = ['chat_id', 'title', 'added_date', 'member_count', 'quizzes_received', 'last_activity']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for group in self.groups:
+                        writer.writerow(group)
+                
+                # Send groups CSV
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=open('groups_export.csv', 'rb'),
+                    filename='groups_export.csv',
+                    caption="👥 Groups Export (CSV)"
+                )
+            
+            # Export stats to JSON
+            with open('stats_export.json', 'w', encoding='utf-8') as f:
+                json.dump(self.stats, f, indent=2, ensure_ascii=False)
+            
+            # Send stats JSON
             await context.bot.send_document(
                 chat_id=user_id,
-                document=open('bot_data.xlsx', 'rb'),
-                filename='bot_data.xlsx',
-                caption="📊 Bot Data Export"
+                document=open('stats_export.json', 'rb'),
+                filename='stats_export.json',
+                caption="📊 Statistics Export (JSON)"
+            )
+            
+            # Send summary
+            summary = (
+                f"✅ **Data Export Completed**\n\n"
+                f"📁 Files exported:\n"
+                f"• quizzes_export.csv ({len(self.quizzes)} quizzes)\n"
+                f"• groups_export.csv ({len(self.groups)} groups)\n"
+                f"• stats_export.json (statistics)\n\n"
+                f"💾 All data has been exported successfully!"
             )
             
             if update.callback_query:
-                await update.callback_query.answer("Data exported successfully!")
+                await update.callback_query.edit_message_text(summary)
+            else:
+                await update.message.reply_text(summary)
                 
         except Exception as e:
             error_msg = f"❌ Error exporting data: {str(e)}"
