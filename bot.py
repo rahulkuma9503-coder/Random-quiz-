@@ -89,6 +89,13 @@ class MongoDB:
             return collection.delete_one(query)
         return None
     
+    def delete_many(self, collection_name, query=None):
+        """Delete multiple documents"""
+        collection = self.get_collection(collection_name)
+        if collection is not None:
+            return collection.delete_many(query or {})
+        return None
+    
     def replace_one(self, collection_name, query, replacement):
         """Replace one document"""
         collection = self.get_collection(collection_name)
@@ -214,6 +221,7 @@ class QuizBot:
                     [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
                     [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
                     [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
+                    [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
                     [InlineKeyboardButton("📋 Export Data", callback_data="export_data")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -224,17 +232,18 @@ class QuizBot:
                     f"👋 **Admin Dashboard**\n\n"
                     f"I'm your Quiz Bot! Choose an option below:\n\n"
                     f"📊 **Statistics** - View detailed bot analytics\n"
-                    f"📝 **Add Quiz** - Create and send me a poll to save as quiz\n"
+                    f"📝 **Add Quiz** - Create and send me a QUIZ MODE poll to save\n"
                     f"⚙️ **Settings** - Configure bot settings (Current: {quiz_interval_hours}h interval)\n"
                     f"📢 **Broadcast** - Send message to all groups\n"
                     f"👥 **Manage Groups** - View and manage groups\n"
+                    f"🔄 **Reset Quizzes** - Delete all saved quizzes\n"
                     f"📋 **Export Data** - Export quizzes and stats\n\n"
-                    f"To add a quiz: Create a poll and send it to me!",
+                    f"📢 **Important:** I only accept QUIZ MODE polls (with correct answers)!",
                     reply_markup=reply_markup
                 )
             else:
                 await update.message.reply_text(
-                    "👋 Hello! I'm a quiz bot that sends random poll quizzes regularly.\n\n"
+                    "👋 Hello! I'm a quiz bot that sends random quiz polls regularly.\n\n"
                     "Add me to your group and make me an admin to start receiving fun quiz polls!\n\n"
                     "⚡ **Group Commands:**\n"
                     "• /rquiz - Send immediate random quiz (Group admins only)"
@@ -304,29 +313,41 @@ class QuizBot:
             await self.save_poll_quiz(update, update.message.poll)
         else:
             await update.message.reply_text(
-                "❌ Please send a poll to save as a quiz!\n\n"
-                "To create a poll:\n"
+                "❌ Please send a QUIZ MODE poll to save as a quiz!\n\n"
+                "To create a QUIZ MODE poll:\n"
                 "1. Click the 📎 attachment icon\n"
                 "2. Select 'Poll'\n"
                 "3. Enter your question and options\n"
-                "4. Send it to me\n\n"
-                "I'll automatically save it as a quiz!\n\n"
-                "📝 Note: All quizzes will show who voted for what (non-anonymous)"
+                "4. ✅ Enable 'Quiz Mode' and set correct answer\n"
+                "5. Send it to me\n\n"
+                "🚫 I only accept QUIZ MODE polls (with correct answers)!\n"
+                "🚫 Regular polls will be ignored."
             )
     
     async def save_poll_quiz(self, update: Update, poll):
-        """Save a poll as a quiz"""
-        # Check if it's a quiz poll (has correct option) or regular poll
-        is_quiz = hasattr(poll, 'correct_option_id') and poll.correct_option_id is not None
+        """Save a poll as a quiz - ONLY if it's a QUIZ MODE poll"""
+        # Check if it's a quiz mode poll (has correct answer)
+        if poll.type != Poll.QUIZ:
+            await update.message.reply_text(
+                "❌ **Regular Poll Ignored!**\n\n"
+                "I only accept **QUIZ MODE** polls with correct answers.\n\n"
+                "📝 **To create a QUIZ MODE poll:**\n"
+                "1. Create a poll as usual\n"
+                "2. ✅ Enable **'Quiz Mode'** \n"
+                "3. Set the correct answer\n"
+                "4. Send it to me\n\n"
+                "🚫 Regular polls without correct answers are ignored."
+            )
+            return
         
+        # It's a quiz mode poll - save it
         quiz = {
             'type': 'poll',
             'question': poll.question,
             'options': [option.text for option in poll.options],
             'is_anonymous': False,  # Force non-anonymous voting
             'allows_multiple_answers': poll.allows_multiple_answers,
-            'is_quiz': is_quiz,  # Track if it's a quiz or regular poll
-            'correct_option_id': poll.correct_option_id if hasattr(poll, 'correct_option_id') else None,
+            'correct_option_id': poll.correct_option_id,
             'added_date': datetime.now().isoformat(),
             'sent_count': 0,
             'manual_sent_count': 0,
@@ -344,15 +365,14 @@ class QuizBot:
         
         # Format options for display
         options_text = "\n".join([f"• {option}" for option in quiz['options']])
-        
-        quiz_type = "🎯 Quiz Poll" if is_quiz else "📊 Regular Poll"
+        correct_answer = quiz['options'][quiz['correct_option_id']]
         
         await update.message.reply_text(
-            f"✅ **{quiz_type} Saved Successfully!**\n\n"
+            f"✅ **Quiz Mode Poll Saved Successfully!**\n\n"
             f"📝 **Question:** {quiz['question']}\n\n"
             f"📋 **Options:**\n{options_text}\n\n"
+            f"✅ **Correct Answer:** {correct_answer}\n"
             f"👤 **Voting:** Non-anonymous (voters visible)\n"
-            f"🎯 **Type:** {'Quiz (with correct answer)' if is_quiz else 'Regular Poll (no correct answer)'}\n"
             f"📊 Total quizzes: {len(self.quizzes)}\n"
             f"👥 Will be sent to: {len(self.groups)} groups\n"
             f"⏰ Next quiz in: {self.quiz_interval / 3600} hours\n\n"
@@ -405,31 +425,16 @@ class QuizBot:
     async def send_quiz_to_group(self, group, quiz):
         """Send a quiz to a specific group"""
         if quiz['type'] == 'poll':
-            # Determine if it's a quiz or regular poll
-            is_quiz = quiz.get('is_quiz', False)
-            correct_option_id = quiz.get('correct_option_id')
-            
-            # Set poll type and parameters
-            poll_type = Poll.QUIZ if is_quiz and correct_option_id is not None else Poll.REGULAR
-            
-            # Prepare message text based on type
-            if is_quiz and correct_option_id is not None:
-                question_text = f"🎯 Quiz Time: {quiz['question']}"
-                explanation = "Check back later for the correct answer!"
-            else:
-                question_text = f"📊 Poll: {quiz['question']}"
-                explanation = None
-            
-            # Send as poll with proper type
+            # Send as poll with non-anonymous voting
             message = await self.application.bot.send_poll(
                 chat_id=group['chat_id'],
-                question=question_text,
+                question=f"🎯 Quiz Time: {quiz['question']}",
                 options=quiz['options'],
                 is_anonymous=False,  # Force non-anonymous voting
                 allows_multiple_answers=quiz.get('allows_multiple_answers', False),
-                type=poll_type,
-                correct_option_id=correct_option_id if is_quiz else None,
-                explanation=explanation,
+                type=Poll.QUIZ,  # Always send as quiz mode
+                correct_option_id=quiz.get('correct_option_id'),
+                explanation="Check back later for results!",
                 open_period=0,  # No time limit
             )
         
@@ -476,7 +481,7 @@ class QuizBot:
         # Check if there are active quizzes
         active_quizzes = [q for q in self.quizzes if q.get('is_active', True)]
         if not active_quizzes:
-            await update.message.reply_text("❌ No quizzes available! Please add some quizzes first.")
+            await update.message.reply_text("❌ No quizzes available! Please add some quiz mode polls first.")
             return
         
         # Ensure group is registered (auto-register if not)
@@ -514,22 +519,83 @@ class QuizBot:
             # Send the quiz
             await self.send_quiz_to_group(group, quiz)
             
-            # Determine quiz type for confirmation message
-            quiz_type = "Quiz" if quiz.get('is_quiz', False) else "Poll"
-            
             # Send confirmation message
+            correct_answer = quiz['options'][quiz['correct_option_id']] if quiz.get('correct_option_id') is not None else "Unknown"
+            
             await update.message.reply_text(
-                f"✅ **Random {quiz_type} Sent!**\n\n"
+                f"✅ **Random Quiz Sent!**\n\n"
                 f"📝 Question: {quiz['question']}\n"
+                f"✅ Correct Answer: {correct_answer}\n"
                 f"🕐 Sent by: {update.effective_user.first_name}\n"
-                f"🎯 Type: {quiz_type}\n"
-                f"📊 This {quiz_type.lower()} has been sent {quiz.get('sent_count', 0)} times automatically "
+                f"📊 This quiz has been sent {quiz.get('sent_count', 0)} times automatically "
                 f"and {quiz.get('manual_sent_count', 0)} times manually"
             )
             
         except Exception as e:
             print(f"Error sending immediate quiz: {e}")
             await update.message.reply_text("❌ Failed to send quiz. Please try again later.")
+    
+    async def reset_quizzes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /reset command - delete all quizzes"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ This command is for admin only.")
+            return
+        
+        # Create confirmation keyboard
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ YES, Delete All Quizzes", callback_data="confirm_reset"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_reset")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🚨 **Reset All Quizzes**\n\n"
+            "⚠️ **WARNING: This action cannot be undone!**\n\n"
+            "This will delete ALL saved quizzes permanently.\n"
+            f"📝 **Total quizzes to delete:** {len(self.quizzes)}\n\n"
+            "Are you sure you want to continue?",
+            reply_markup=reply_markup
+        )
+    
+    async def confirm_reset_quizzes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Confirm and execute quiz reset"""
+        user_id = update.callback_query.from_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.callback_query.answer("This command is for admin only.")
+            return
+        
+        # Delete all quizzes from MongoDB
+        deleted_count = self.mongo.delete_many('quizzes', {}).deleted_count
+        
+        # Reset quiz-related stats
+        self.stats['quizzes_added'] = 0
+        self.stats['total_quizzes_sent'] = 0
+        self.stats['manual_quizzes_sent'] = 0
+        self.stats['last_quiz_sent'] = None
+        self.save_stats()
+        
+        # Reload quizzes
+        self.quizzes = self.load_quizzes()
+        
+        await update.callback_query.edit_message_text(
+            f"✅ **All Quizzes Deleted Successfully!**\n\n"
+            f"🗑️ **Deleted quizzes:** {deleted_count}\n"
+            f"📊 **Database reset:** All quiz statistics cleared\n\n"
+            f"💡 You can now start adding new quiz mode polls!"
+        )
+    
+    async def cancel_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the reset operation"""
+        await update.callback_query.edit_message_text(
+            "✅ **Reset Cancelled**\n\n"
+            "No quizzes were deleted.\n"
+            f"📝 Your {len(self.quizzes)} quizzes are safe."
+        )
     
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed bot statistics"""
@@ -556,18 +622,12 @@ class QuizBot:
         # Most popular quiz
         most_sent = max(self.quizzes, key=lambda x: x.get('sent_count', 0)) if self.quizzes else None
         
-        # Count poll types
-        quiz_polls = len([q for q in self.quizzes if q.get('is_quiz', False)])
-        regular_polls = len([q for q in self.quizzes if not q.get('is_quiz', True)])
-        
         quiz_interval_hours = self.quiz_interval / 3600
         
         stats_text = (
             f"📊 **Detailed Bot Statistics**\n\n"
             f"📝 **Quizzes Database**\n"
             f"   • Total quizzes: {total_quizzes}\n"
-            f"   • Quiz polls: {quiz_polls}\n"
-            f"   • Regular polls: {regular_polls}\n"
             f"   • Quizzes added: {quizzes_added}\n"
             f"   • Most sent quiz: {most_sent['sent_count'] if most_sent else 0} times\n\n"
             
@@ -591,6 +651,7 @@ class QuizBot:
         
         keyboard = [
             [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
             [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
@@ -612,10 +673,6 @@ class QuizBot:
         
         quiz_interval_hours = self.quiz_interval / 3600
         
-        # Count quiz types
-        quiz_polls = len([q for q in self.quizzes if q.get('is_quiz', False)])
-        regular_polls = len([q for q in self.quizzes if not q.get('is_quiz', True)])
-        
         settings_text = (
             f"⚙️ **Bot Settings**\n\n"
             f"🕐 **Quiz Interval**: {quiz_interval_hours} hours\n"
@@ -624,15 +681,17 @@ class QuizBot:
             f"   - Data persistence status\n\n"
             f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
             f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n"
-            f"🎯 **Quiz Polls**: {quiz_polls}\n"
-            f"📊 **Regular Polls**: {regular_polls}\n"
             f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n\n"
+            f"📢 **Quiz Mode Only**: ✅ Enabled\n"
+            f"   - Only accepts polls with correct answers\n\n"
             f"💡 Use /setdelay <hours> to change the quiz interval\n"
-            f"💡 Group admins can use /rquiz for immediate quizzes"
+            f"💡 Group admins can use /rquiz for immediate quizzes\n"
+            f"💡 Use /reset to delete all quizzes"
         )
         
         keyboard = [
             [InlineKeyboardButton("🕐 Set Quiz Interval", callback_data="set_interval")],
+            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
             [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
             [InlineKeyboardButton("🔄 Refresh Groups", callback_data="refresh_groups")],
             [InlineKeyboardButton("📊 Statistics", callback_data="stats")]
@@ -821,7 +880,7 @@ class QuizBot:
             # Export quizzes to CSV
             if self.quizzes:
                 with open('quizzes_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['_id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'is_quiz', 'correct_option_id', 'added_date', 'sent_count', 'manual_sent_count', 'last_sent', 'is_active']
+                    fieldnames = ['_id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'correct_option_id', 'added_date', 'sent_count', 'manual_sent_count', 'last_sent', 'is_active']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for quiz in self.quizzes:
@@ -1006,18 +1065,17 @@ class QuizBot:
             await self.show_stats(update, context)
         elif data == "add_quiz":
             await query.edit_message_text(
-                "📝 **Add New Quiz Poll**\n\n"
+                "📝 **Add New Quiz Mode Poll**\n\n"
                 "To add a quiz:\n\n"
                 "1. Click the 📎 attachment icon\n"
                 "2. Select 'Poll'\n"
                 "3. Enter your question and options\n"
-                "4. **Enable 'Quiz Mode' for correct answers**\n"
-                "5. Send the poll to me\n\n"
-                "📢 **Important:** \n"
-                "• Enable 'Quiz Mode' to create quizzes with correct answers\n"
-                "• All quizzes will show who voted for what (non-anonymous voting)\n\n"
-                "I'll automatically save it and send it to groups!\n\n"
-                "💡 Group admins can use /rquiz for immediate quizzes"
+                "4. ✅ **Enable 'Quiz Mode'** (Important!)\n"
+                "5. Set the correct answer\n"
+                "6. Send it to me\n\n"
+                "🚫 **I only accept QUIZ MODE polls with correct answers!**\n"
+                "🚫 Regular polls without correct answers will be ignored.\n\n"
+                "📢 Make sure to enable **Quiz Mode** when creating the poll!"
             )
         elif data == "settings":
             await self.show_settings(update, context)
@@ -1027,6 +1085,12 @@ class QuizBot:
             await self.manage_groups(update, context)
         elif data == "export_data":
             await self.export_data(update, context)
+        elif data == "reset_quizzes":
+            await self.reset_quizzes_command(update, context)
+        elif data == "confirm_reset":
+            await self.confirm_reset_quizzes(update, context)
+        elif data == "cancel_reset":
+            await self.cancel_reset(update, context)
         elif data == "set_interval":
             await self.set_quiz_interval_callback(update, context)
         elif data == "cancel_broadcast":
@@ -1096,6 +1160,7 @@ class QuizBot:
         self.application.add_handler(CommandHandler("groups", self.manage_groups))
         self.application.add_handler(CommandHandler("setdelay", self.set_quiz_interval_command))
         self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
+        self.application.add_handler(CommandHandler("reset", self.reset_quizzes_command))
         
         # Handle both text messages and polls
         self.application.add_handler(MessageHandler(
@@ -1135,6 +1200,8 @@ class QuizBot:
         print(f"⏰ Quiz interval: {quiz_interval_hours} hours")
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
         print(f"🎯 /rquiz command enabled for group admins")
+        print(f"🔄 /reset command available for admin")
+        print(f"📝 Quiz Mode Only: ✅ Enabled - Only accepts polls with correct answers")
         
         # Keep the bot running
         while True:
