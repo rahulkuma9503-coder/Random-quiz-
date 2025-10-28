@@ -3,9 +3,11 @@ import json
 import random
 import asyncio
 import csv
+import signal
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import aiohttp
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -36,6 +38,7 @@ class QuizBot:
             'group_engagement': {}
         })
         self.broadcast_mode = {}  # Track users in broadcast mode
+        self.scheduler_task = None
         
     def load_data(self, filename, default):
         """Load data from JSON file"""
@@ -569,42 +572,69 @@ class QuizBot:
             await asyncio.sleep(3600)  # Wait 1 hour
             await self.send_random_quiz()
     
-    async def run(self):
-        """Start the bot"""
+    async def start_bot(self):
+        """Start the bot with proper event loop handling"""
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
         # Start the scheduler in background
-        asyncio.create_task(self.start_scheduler())
+        self.scheduler_task = asyncio.create_task(self.start_scheduler())
         
         # Start the bot
         print("🤖 Bot is running with enhanced features...")
         await self.application.run_polling()
 
-# For Render.com deployment
-async def web_server():
-    """Simple web server to keep the bot alive on Render"""
-    async def handle(request):
-        return aiohttp.web.Response(text="Bot is running!")
+    async def stop_bot(self):
+        """Stop the bot gracefully"""
+        if self.scheduler_task:
+            self.scheduler_task.cancel()
+        if self.application:
+            await self.application.stop()
+            await self.application.shutdown()
+
+# Web server for Render.com
+async def handle_health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    """Start the web server for health checks"""
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    app.router.add_get('/health', handle_health_check)
     
-    app = aiohttp.web.Application()
-    app.router.add_get('/', handle)
-    
-    runner = aiohttp.web.AppRunner(app)
+    runner = web.AppRunner(app)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     print(f"🌐 Web server running on port {PORT}")
+    return runner
 
 async def main():
     """Main function to run both bot and web server"""
     bot = QuizBot()
     
-    # Run both bot and web server concurrently
-    await asyncio.gather(
-        bot.run(),
-        web_server()
-    )
+    # Start web server
+    runner = await start_web_server()
+    
+    try:
+        # Start the bot (this will block until the bot is stopped)
+        await bot.start_bot()
+    except KeyboardInterrupt:
+        print("Received stop signal, shutting down...")
+    finally:
+        # Cleanup
+        await bot.stop_bot()
+        await runner.cleanup()
+        print("Bot stopped gracefully")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    # Set up signal handlers for graceful shutdown
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        loop.close()
