@@ -44,51 +44,55 @@ class MongoDB:
             # Fallback to in-memory storage
             self.db = None
     
+    def is_connected(self):
+        """Check if MongoDB is connected"""
+        return self.db is not None
+    
     def get_collection(self, name):
         """Get a collection from MongoDB"""
-        if self.db is None:
-            return None
-        return self.db[name]
+        if self.db is not None:
+            return self.db[name]
+        return None
     
     def insert_one(self, collection_name, document):
         """Insert one document"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return collection.insert_one(document)
         return None
     
     def find(self, collection_name, query=None):
         """Find documents"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return list(collection.find(query or {}))
         return []
     
     def find_one(self, collection_name, query):
         """Find one document"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return collection.find_one(query)
         return None
     
     def update_one(self, collection_name, query, update):
         """Update one document"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return collection.update_one(query, update)
         return None
     
     def delete_one(self, collection_name, query):
         """Delete one document"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return collection.delete_one(query)
         return None
     
     def replace_one(self, collection_name, query, replacement):
         """Replace one document"""
         collection = self.get_collection(collection_name)
-        if collection:
+        if collection is not None:
             return collection.replace_one(query, replacement)
         return None
 
@@ -562,7 +566,7 @@ class QuizBot:
             f"⚙️ **Bot Settings**\n\n"
             f"🕐 **Quiz Interval**: {quiz_interval_hours} hours\n"
             f"   - Current delay between random quizzes\n\n"
-            f"📊 **Database**: {'MongoDB' if self.mongo.db else 'In-Memory'}\n"
+            f"📊 **Database**: {'MongoDB' if self.mongo.is_connected() else 'In-Memory'}\n"
             f"   - Data persistence status\n\n"
             f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
             f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n"
