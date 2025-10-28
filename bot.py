@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 # Load environment variables
 load_dotenv()
@@ -17,43 +19,160 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))
 PORT = int(os.getenv('PORT', 10000))
-
-# File paths
-QUIZZES_FILE = 'quizzes.json'
-GROUPS_FILE = 'groups.json'
-STATS_FILE = 'bot_stats.json'
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/quizbot')
 
 # Global bot instance
 bot_instance = None
 
+class MongoDB:
+    def __init__(self, uri):
+        self.uri = uri
+        self.client = None
+        self.db = None
+        self.connect()
+    
+    def connect(self):
+        """Connect to MongoDB"""
+        try:
+            self.client = MongoClient(self.uri)
+            self.db = self.client.quizbot
+            # Test connection
+            self.client.admin.command('ping')
+            print("✅ Connected to MongoDB successfully!")
+        except ConnectionFailure as e:
+            print(f"❌ MongoDB connection failed: {e}")
+            # Fallback to in-memory storage
+            self.db = None
+    
+    def get_collection(self, name):
+        """Get a collection from MongoDB"""
+        if self.db is None:
+            return None
+        return self.db[name]
+    
+    def insert_one(self, collection_name, document):
+        """Insert one document"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return collection.insert_one(document)
+        return None
+    
+    def find(self, collection_name, query=None):
+        """Find documents"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return list(collection.find(query or {}))
+        return []
+    
+    def find_one(self, collection_name, query):
+        """Find one document"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return collection.find_one(query)
+        return None
+    
+    def update_one(self, collection_name, query, update):
+        """Update one document"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return collection.update_one(query, update)
+        return None
+    
+    def delete_one(self, collection_name, query):
+        """Delete one document"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return collection.delete_one(query)
+        return None
+    
+    def replace_one(self, collection_name, query, replacement):
+        """Replace one document"""
+        collection = self.get_collection(collection_name)
+        if collection:
+            return collection.replace_one(query, replacement)
+        return None
+
 class QuizBot:
     def __init__(self):
         self.application = None
-        self.quizzes = self.load_data(QUIZZES_FILE, [])
-        self.groups = self.load_data(GROUPS_FILE, [])
-        self.stats = self.load_data(STATS_FILE, {
-            'total_quizzes_sent': 0,
-            'total_groups_reached': 0,
-            'quizzes_added': 0,
-            'bot_start_time': datetime.now().isoformat(),
-            'last_quiz_sent': None,
-            'group_engagement': {}
-        })
+        self.mongo = MongoDB(MONGODB_URI)
+        self.quizzes = self.load_quizzes()
+        self.groups = self.load_groups()
+        self.settings = self.load_settings()
+        self.stats = self.load_stats()
         self.broadcast_mode = {}
         self.scheduler_task = None
+        self.quiz_interval = self.settings.get('quiz_interval', 3600)  # Default 1 hour
         
-    def load_data(self, filename, default):
-        """Load data from JSON file"""
-        try:
-            with open(filename, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return default
+    def load_quizzes(self):
+        """Load quizzes from MongoDB"""
+        return self.mongo.find('quizzes')
     
-    def save_data(self, filename, data):
-        """Save data to JSON file"""
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
+    def load_groups(self):
+        """Load groups from MongoDB"""
+        return self.mongo.find('groups')
+    
+    def load_settings(self):
+        """Load settings from MongoDB"""
+        settings = self.mongo.find_one('settings', {'_id': 'bot_settings'})
+        if not settings:
+            # Default settings
+            settings = {
+                '_id': 'bot_settings',
+                'quiz_interval': 3600,  # 1 hour in seconds
+                'max_quizzes_per_day': 24,
+                'auto_clean_inactive': True,
+                'inactive_days_threshold': 7,
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat()
+            }
+            self.mongo.insert_one('settings', settings)
+        return settings
+    
+    def load_stats(self):
+        """Load stats from MongoDB"""
+        stats = self.mongo.find_one('stats', {'_id': 'bot_stats'})
+        if not stats:
+            # Default stats
+            stats = {
+                '_id': 'bot_stats',
+                'total_quizzes_sent': 0,
+                'total_groups_reached': 0,
+                'quizzes_added': 0,
+                'bot_start_time': datetime.now().isoformat(),
+                'last_quiz_sent': None,
+                'group_engagement': {},
+                'total_broadcasts_sent': 0
+            }
+            self.mongo.insert_one('stats', stats)
+        return stats
+    
+    def save_quiz(self, quiz):
+        """Save quiz to MongoDB"""
+        if '_id' in quiz:
+            self.mongo.replace_one('quizzes', {'_id': quiz['_id']}, quiz)
+        else:
+            result = self.mongo.insert_one('quizzes', quiz)
+            if result and result.inserted_id:
+                quiz['_id'] = result.inserted_id
+    
+    def save_group(self, group):
+        """Save group to MongoDB"""
+        if '_id' in group:
+            self.mongo.replace_one('groups', {'_id': group['_id']}, group)
+        else:
+            result = self.mongo.insert_one('groups', group)
+            if result and result.inserted_id:
+                group['_id'] = result.inserted_id
+    
+    def save_settings(self):
+        """Save settings to MongoDB"""
+        self.settings['updated_at'] = datetime.now().isoformat()
+        self.mongo.replace_one('settings', {'_id': 'bot_settings'}, self.settings)
+    
+    def save_stats(self):
+        """Save stats to MongoDB"""
+        self.mongo.replace_one('stats', {'_id': 'bot_stats'}, self.stats)
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -65,26 +184,30 @@ class QuizBot:
                 keyboard = [
                     [InlineKeyboardButton("📊 View Statistics", callback_data="stats")],
                     [InlineKeyboardButton("📝 Add Quiz", callback_data="add_quiz")],
+                    [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
                     [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
                     [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
                     [InlineKeyboardButton("📋 Export Data", callback_data="export_data")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
+                quiz_interval_hours = self.quiz_interval / 3600
+                
                 await update.message.reply_text(
-                    "👋 **Admin Dashboard**\n\n"
-                    "I'm your Quiz Bot! Choose an option below:\n\n"
-                    "📊 **Statistics** - View detailed bot analytics\n"
-                    "📝 **Add Quiz** - Create and send me a poll to save as quiz\n"
-                    "📢 **Broadcast** - Send message to all groups\n"
-                    "👥 **Manage Groups** - View and manage groups\n"
-                    "📋 **Export Data** - Export quizzes and stats\n\n"
-                    "To add a quiz: Create a poll and send it to me!",
+                    f"👋 **Admin Dashboard**\n\n"
+                    f"I'm your Quiz Bot! Choose an option below:\n\n"
+                    f"📊 **Statistics** - View detailed bot analytics\n"
+                    f"📝 **Add Quiz** - Create and send me a poll to save as quiz\n"
+                    f"⚙️ **Settings** - Configure bot settings (Current: {quiz_interval_hours}h interval)\n"
+                    f"📢 **Broadcast** - Send message to all groups\n"
+                    f"👥 **Manage Groups** - View and manage groups\n"
+                    f"📋 **Export Data** - Export quizzes and stats\n\n"
+                    f"To add a quiz: Create a poll and send it to me!",
                     reply_markup=reply_markup
                 )
             else:
                 await update.message.reply_text(
-                    "👋 Hello! I'm a quiz bot that sends random poll quizzes every hour.\n\n"
+                    "👋 Hello! I'm a quiz bot that sends random poll quizzes regularly.\n\n"
                     "Add me to your group and make me an admin to start receiving fun quiz polls!"
                 )
         else:
@@ -96,26 +219,31 @@ class QuizBot:
         chat_id = update.effective_chat.id
         chat_title = update.effective_chat.title
         
+        # Check if group already exists in MongoDB
+        existing_group = self.mongo.find_one('groups', {'chat_id': chat_id})
+        
         group_info = {
             'chat_id': chat_id,
             'title': chat_title,
             'added_date': datetime.now().isoformat(),
             'member_count': update.effective_chat.get_member_count() if update.effective_chat.get_member_count else 0,
-            'quizzes_received': 0,
-            'last_activity': datetime.now().isoformat()
+            'quizzes_received': existing_group['quizzes_received'] if existing_group else 0,
+            'last_activity': datetime.now().isoformat(),
+            'is_active': True
         }
         
-        # Check if group already exists
-        existing_group = next((g for g in self.groups if g['chat_id'] == chat_id), None)
-        
         if existing_group:
-            existing_group.update(group_info)
-            message = f"🎉 I'm back in {chat_title}! I'll continue sending quiz polls every hour."
+            # Update existing group
+            group_info['_id'] = existing_group['_id']
+            self.mongo.replace_one('groups', {'_id': existing_group['_id']}, group_info)
+            message = f"🎉 I'm back in {chat_title}! I'll continue sending quiz polls."
         else:
-            self.groups.append(group_info)
-            message = f"🎉 Thanks for adding me to {chat_title}!\n\nI'll send random quiz polls every hour automatically!"
+            # Add new group
+            self.mongo.insert_one('groups', group_info)
+            message = f"🎉 Thanks for adding me to {chat_title}!\n\nI'll send random quiz polls automatically!"
         
-        self.save_data(GROUPS_FILE, self.groups)
+        # Reload groups from MongoDB
+        self.groups = self.load_groups()
         
         # Send welcome message with group controls for admin
         if update.effective_user.id == ADMIN_USER_ID:
@@ -152,29 +280,32 @@ class QuizBot:
                 "2. Select 'Poll'\n"
                 "3. Enter your question and options\n"
                 "4. Send it to me\n\n"
-                "I'll automatically save it as a quiz!"
+                "I'll automatically save it as a quiz!\n\n"
+                "📝 Note: All quizzes will show who voted for what (non-anonymous)"
             )
     
     async def save_poll_quiz(self, update: Update, poll):
         """Save a poll as a quiz"""
         quiz = {
-            'id': update.message.message_id,
             'type': 'poll',
             'question': poll.question,
             'options': [option.text for option in poll.options],
-            'is_anonymous': poll.is_anonymous,
+            'is_anonymous': False,  # Force non-anonymous voting
             'allows_multiple_answers': poll.allows_multiple_answers,
             'correct_option_id': poll.correct_option_id if hasattr(poll, 'correct_option_id') else None,
             'added_date': datetime.now().isoformat(),
             'sent_count': 0,
             'last_sent': None,
-            'engagement': 0
+            'engagement': 0,
+            'is_active': True
         }
         
-        self.quizzes.append(quiz)
+        self.mongo.insert_one('quizzes', quiz)
         self.stats['quizzes_added'] += 1
-        self.save_data(QUIZZES_FILE, self.quizzes)
-        self.save_data(STATS_FILE, self.stats)
+        self.save_stats()
+        
+        # Reload quizzes from MongoDB
+        self.quizzes = self.load_quizzes()
         
         # Format options for display
         options_text = "\n".join([f"• {option}" for option in quiz['options']])
@@ -183,8 +314,10 @@ class QuizBot:
             f"✅ **Poll Quiz Saved Successfully!**\n\n"
             f"📝 **Question:** {quiz['question']}\n\n"
             f"📋 **Options:**\n{options_text}\n\n"
+            f"👤 **Voting:** Non-anonymous (voters visible)\n"
             f"📊 Total quizzes: {len(self.quizzes)}\n"
-            f"👥 Will be sent to: {len(self.groups)} groups"
+            f"👥 Will be sent to: {len(self.groups)} groups\n"
+            f"⏰ Next quiz in: {self.quiz_interval / 3600} hours"
         )
     
     async def send_random_quiz(self):
@@ -192,26 +325,35 @@ class QuizBot:
         if not self.quizzes or not self.groups:
             return
         
-        quiz = random.choice(self.quizzes)
+        # Get active quizzes only
+        active_quizzes = [q for q in self.quizzes if q.get('is_active', True)]
+        if not active_quizzes:
+            return
+        
+        quiz = random.choice(active_quizzes)
         
         # Update quiz stats
         quiz['sent_count'] += 1
         quiz['last_sent'] = datetime.now().isoformat()
+        self.save_quiz(quiz)
         
         # Update global stats
         self.stats['total_quizzes_sent'] += len(self.groups)
         self.stats['last_quiz_sent'] = datetime.now().isoformat()
+        self.save_stats()
         
         sent_to = 0
-        for group in self.groups:
+        active_groups = [g for g in self.groups if g.get('is_active', True)]
+        
+        for group in active_groups:
             try:
                 if quiz['type'] == 'poll':
-                    # Send as poll
+                    # Send as poll with non-anonymous voting
                     message = await self.application.bot.send_poll(
                         chat_id=group['chat_id'],
                         question=f"🎯 Quiz Time: {quiz['question']}",
                         options=quiz['options'],
-                        is_anonymous=quiz.get('is_anonymous', False),
+                        is_anonymous=False,  # Force non-anonymous voting
                         allows_multiple_answers=quiz.get('allows_multiple_answers', False),
                         type=Poll.QUIZ if quiz.get('correct_option_id') is not None else Poll.REGULAR,
                         correct_option_id=quiz.get('correct_option_id'),
@@ -220,8 +362,9 @@ class QuizBot:
                     )
                 
                 # Update group stats
-                group['quizzes_received'] += 1
+                group['quizzes_received'] = group.get('quizzes_received', 0) + 1
                 group['last_activity'] = datetime.now().isoformat()
+                self.save_group(group)
                 
                 # Track engagement
                 if str(group['chat_id']) not in self.stats['group_engagement']:
@@ -233,12 +376,15 @@ class QuizBot:
                 
             except Exception as e:
                 print(f"Failed to send to group {group['chat_id']}: {e}")
+                # Mark group as inactive if sending fails repeatedly
+                group['is_active'] = False
+                self.save_group(group)
         
-        self.save_data(QUIZZES_FILE, self.quizzes)
-        self.save_data(STATS_FILE, self.stats)
-        self.save_data(GROUPS_FILE, self.groups)
+        # Reload groups and stats after updates
+        self.groups = self.load_groups()
+        self.save_stats()
         
-        print(f"📤 Sent quiz poll to {sent_to}/{len(self.groups)} groups at {datetime.now()}")
+        print(f"📤 Sent quiz poll to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
     
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed bot statistics"""
@@ -252,12 +398,13 @@ class QuizBot:
         total_groups = len(self.groups)
         total_quizzes_sent = self.stats['total_quizzes_sent']
         quizzes_added = self.stats['quizzes_added']
+        active_groups_count = len([g for g in self.groups if g.get('is_active', True)])
         
         # Calculate active groups (active in last 7 days)
         week_ago = datetime.now() - timedelta(days=7)
-        active_groups = len([
+        recently_active = len([
             g for g in self.groups 
-            if datetime.fromisoformat(g['last_activity']) > week_ago
+            if datetime.fromisoformat(g['last_activity']) > week_ago and g.get('is_active', True)
         ])
         
         # Most popular quiz
@@ -266,6 +413,8 @@ class QuizBot:
         # Count poll types
         quiz_polls = len([q for q in self.quizzes if q.get('correct_option_id') is not None])
         regular_polls = len([q for q in self.quizzes if q.get('correct_option_id') is None])
+        
+        quiz_interval_hours = self.quiz_interval / 3600
         
         stats_text = (
             f"📊 **Detailed Bot Statistics**\n\n"
@@ -278,13 +427,15 @@ class QuizBot:
             
             f"👥 **Groups Analytics**\n"
             f"   • Total groups: {total_groups}\n"
-            f"   • Active groups: {active_groups}\n"
+            f"   • Active groups: {active_groups_count}\n"
+            f"   • Recently active: {recently_active}\n"
             f"   • Total quizzes sent: {total_quizzes_sent}\n\n"
             
             f"⏰ **Performance**\n"
             f"   • Bot started: {datetime.fromisoformat(self.stats['bot_start_time']).strftime('%Y-%m-%d %H:%M')}\n"
             f"   • Last quiz sent: {datetime.fromisoformat(self.stats['last_quiz_sent']).strftime('%Y-%m-%d %H:%M') if self.stats['last_quiz_sent'] else 'Never'}\n"
-            f"   • Next quiz in: ~1 hour\n\n"
+            f"   • Quiz interval: {quiz_interval_hours} hours\n"
+            f"   • Next quiz in: ~{quiz_interval_hours} hours\n\n"
             
             f"📈 **Engagement**\n"
             f"   • Avg quizzes per group: {total_quizzes_sent/total_groups if total_groups > 0 else 0:.1f}\n"
@@ -292,6 +443,7 @@ class QuizBot:
         )
         
         keyboard = [
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
@@ -302,6 +454,90 @@ class QuizBot:
             await update.callback_query.edit_message_text(stats_text, reply_markup=reply_markup)
         else:
             await update.message.reply_text(stats_text, reply_markup=reply_markup)
+    
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show bot settings"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("This command is for admin only.")
+            return
+        
+        quiz_interval_hours = self.quiz_interval / 3600
+        
+        settings_text = (
+            f"⚙️ **Bot Settings**\n\n"
+            f"🕐 **Quiz Interval**: {quiz_interval_hours} hours\n"
+            f"   - Current delay between random quizzes\n\n"
+            f"📊 **Database**: {'MongoDB' if self.mongo.db else 'In-Memory'}\n"
+            f"   - Data persistence status\n\n"
+            f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
+            f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n\n"
+            f"💡 Use /setdelay <hours> to change the quiz interval"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🕐 Set Quiz Interval", callback_data="set_interval")],
+            [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
+            [InlineKeyboardButton("🔄 Refresh Groups", callback_data="refresh_groups")],
+            [InlineKeyboardButton("📊 Statistics", callback_data="stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(settings_text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(settings_text, reply_markup=reply_markup)
+    
+    async def set_quiz_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set quiz interval from callback"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("This command is for admin only.")
+            return
+        
+        await update.callback_query.edit_message_text(
+            "🕐 **Set Quiz Interval**\n\n"
+            "Please send the new interval in hours.\n\n"
+            "Example: `2` for 2 hours, `0.5` for 30 minutes\n\n"
+            "Current interval: {} hours".format(self.quiz_interval / 3600)
+        )
+        
+        # Set a flag to expect interval input
+        context.user_data['waiting_for_interval'] = True
+    
+    async def handle_interval_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle quiz interval input"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID or not context.user_data.get('waiting_for_interval'):
+            return
+        
+        try:
+            hours = float(update.message.text)
+            if hours <= 0:
+                await update.message.reply_text("❌ Interval must be greater than 0 hours.")
+                return
+            
+            new_interval = int(hours * 3600)  # Convert to seconds
+            old_interval = self.quiz_interval
+            
+            self.quiz_interval = new_interval
+            self.settings['quiz_interval'] = new_interval
+            self.save_settings()
+            
+            context.user_data['waiting_for_interval'] = False
+            
+            await update.message.reply_text(
+                f"✅ **Quiz interval updated!**\n\n"
+                f"📅 Old interval: {old_interval / 3600} hours\n"
+                f"📅 New interval: {hours} hours\n\n"
+                f"Next quiz will be sent in approximately {hours} hours."
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number (e.g., 2 for 2 hours, 0.5 for 30 minutes)")
     
     async def start_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start broadcast mode"""
@@ -316,10 +552,12 @@ class QuizBot:
         keyboard = [[InlineKeyboardButton("❌ Cancel Broadcast", callback_data="cancel_broadcast")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        active_groups = len([g for g in self.groups if g.get('is_active', True)])
+        
         message = (
             f"📢 **Broadcast Mode Activated**\n\n"
-            f"Please send the message you want to broadcast to all {len(self.groups)} groups.\n\n"
-            f"⚠️ **Warning:** This will send your message to all groups immediately!\n"
+            f"Please send the message you want to broadcast to all {active_groups} active groups.\n\n"
+            f"⚠️ **Warning:** This will send your message to all active groups immediately!\n"
             f"✏️ Type your message now..."
         )
         
@@ -333,11 +571,12 @@ class QuizBot:
         user_id = update.effective_user.id
         self.broadcast_mode[user_id] = False
         
+        active_groups = [g for g in self.groups if g.get('is_active', True)]
         sent_to = 0
         failed_groups = []
         
-        # Send to all groups
-        for group in self.groups:
+        # Send to all active groups
+        for group in active_groups:
             try:
                 await self.application.bot.send_message(
                     chat_id=group['chat_id'],
@@ -348,17 +587,27 @@ class QuizBot:
             except Exception as e:
                 failed_groups.append(group['title'])
                 print(f"Failed to broadcast to {group['title']}: {e}")
+                # Mark group as inactive
+                group['is_active'] = False
+                self.save_group(group)
+        
+        # Update stats
+        self.stats['total_broadcasts_sent'] = self.stats.get('total_broadcasts_sent', 0) + sent_to
+        self.save_stats()
+        
+        # Reload groups after updates
+        self.groups = self.load_groups()
         
         # Send report to admin
         report = (
             f"✅ **Broadcast Completed**\n\n"
-            f"📤 Sent to: {sent_to}/{len(self.groups)} groups\n"
+            f"📤 Sent to: {sent_to}/{len(active_groups)} active groups\n"
             f"✅ Successful: {sent_to}\n"
             f"❌ Failed: {len(failed_groups)}\n"
         )
         
         if failed_groups:
-            report += f"\nFailed groups:\n" + "\n".join(failed_groups[:10])
+            report += f"\nFailed groups (marked inactive):\n" + "\n".join(failed_groups[:10])
             if len(failed_groups) > 10:
                 report += f"\n... and {len(failed_groups) - 10} more"
         
@@ -376,7 +625,7 @@ class QuizBot:
             # Export quizzes to CSV
             if self.quizzes:
                 with open('quizzes_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'correct_option_id', 'added_date', 'sent_count', 'last_sent']
+                    fieldnames = ['_id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'correct_option_id', 'added_date', 'sent_count', 'last_sent', 'is_active']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for quiz in self.quizzes:
@@ -396,7 +645,7 @@ class QuizBot:
             # Export groups to CSV
             if self.groups:
                 with open('groups_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['chat_id', 'title', 'added_date', 'member_count', 'quizzes_received', 'last_activity']
+                    fieldnames = ['_id', 'chat_id', 'title', 'added_date', 'member_count', 'quizzes_received', 'last_activity', 'is_active']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for group in self.groups:
@@ -453,28 +702,31 @@ class QuizBot:
             return
         
         total_groups = len(self.groups)
-        active_groups = len([g for g in self.groups if g['quizzes_received'] > 0])
+        active_groups = len([g for g in self.groups if g.get('is_active', True)])
+        inactive_groups = total_groups - active_groups
         
         groups_text = (
             f"👥 **Group Management**\n\n"
             f"📊 **Overview**\n"
             f"• Total groups: {total_groups}\n"
             f"• Active groups: {active_groups}\n"
-            f"• Inactive groups: {total_groups - active_groups}\n\n"
+            f"• Inactive groups: {inactive_groups}\n\n"
         )
         
         # Show top 5 most active groups
-        sorted_groups = sorted(self.groups, key=lambda x: x['quizzes_received'], reverse=True)[:5]
+        active_groups_list = [g for g in self.groups if g.get('is_active', True)]
+        sorted_groups = sorted(active_groups_list, key=lambda x: x.get('quizzes_received', 0), reverse=True)[:5]
         
         if sorted_groups:
             groups_text += "🏆 **Top 5 Active Groups:**\n"
             for i, group in enumerate(sorted_groups, 1):
-                groups_text += f"{i}. {group['title']} - {group['quizzes_received']} quizzes\n"
+                groups_text += f"{i}. {group['title']} - {group.get('quizzes_received', 0)} quizzes\n"
         
         keyboard = [
             [InlineKeyboardButton("🔄 Refresh", callback_data="manage_groups")],
             [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
-            [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")]
+            [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
+            [InlineKeyboardButton("🔄 Reactivate All", callback_data="reactivate_all")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -491,22 +743,61 @@ class QuizBot:
             await update.message.reply_text("This command is for admin only.")
             return
         
-        # Find groups that haven't received any quizzes (likely removed the bot)
-        inactive_groups = [g for g in self.groups if g['quizzes_received'] == 0]
+        # Find inactive groups
+        inactive_groups = [g for g in self.groups if not g.get('is_active', True)]
         
         if not inactive_groups:
             await update.callback_query.answer("No inactive groups found!")
             return
         
-        # Remove inactive groups
-        self.groups = [g for g in self.groups if g['quizzes_received'] > 0]
-        self.save_data(GROUPS_FILE, self.groups)
+        # Remove inactive groups from MongoDB
+        for group in inactive_groups:
+            self.mongo.delete_one('groups', {'_id': group['_id']})
+        
+        # Reload groups
+        self.groups = self.load_groups()
         
         await update.callback_query.edit_message_text(
             f"✅ **Cleaned {len(inactive_groups)} inactive groups**\n\n"
-            f"Removed groups that never received any quizzes (likely removed the bot).\n"
-            f"Current active groups: {len(self.groups)}"
+            f"Removed groups that were marked as inactive (likely removed the bot).\n"
+            f"Current active groups: {len([g for g in self.groups if g.get('is_active', True)])}"
         )
+    
+    async def reactivate_all_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Reactivate all groups"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("This command is for admin only.")
+            return
+        
+        # Reactivate all groups
+        for group in self.groups:
+            group['is_active'] = True
+            self.save_group(group)
+        
+        # Reload groups
+        self.groups = self.load_groups()
+        
+        await update.callback_query.edit_message_text(
+            f"✅ **All groups reactivated!**\n\n"
+            f"All {len(self.groups)} groups have been marked as active and will receive quizzes."
+        )
+    
+    async def refresh_groups(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Refresh groups list"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("This command is for admin only.")
+            return
+        
+        # Reload groups from MongoDB
+        self.groups = self.load_groups()
+        
+        active_groups = len([g for g in self.groups if g.get('is_active', True)])
+        
+        await update.callback_query.answer(f"Groups refreshed! {active_groups} active groups loaded.")
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard button presses"""
@@ -526,21 +817,29 @@ class QuizBot:
                 "3. Enter your question and options\n"
                 "4. (Optional) Enable 'Quiz Mode' for correct answers\n"
                 "5. Send the poll to me\n\n"
-                "I'll automatically save it and send it to groups every hour!\n\n"
-                "💡 **Tip:** Use Quiz Mode for questions with right/wrong answers!"
+                "📢 **Important:** All quizzes will show who voted for what (non-anonymous voting)\n\n"
+                "I'll automatically save it and send it to groups every hour!"
             )
+        elif data == "settings":
+            await self.show_settings(update, context)
         elif data == "broadcast":
             await self.start_broadcast(update, context)
         elif data == "manage_groups":
             await self.manage_groups(update, context)
         elif data == "export_data":
             await self.export_data(update, context)
+        elif data == "set_interval":
+            await self.set_quiz_interval(update, context)
         elif data == "cancel_broadcast":
             user_id = query.from_user.id
             self.broadcast_mode[user_id] = False
             await query.edit_message_text("❌ Broadcast cancelled.")
         elif data == "clean_inactive":
             await self.clean_inactive_groups(update, context)
+        elif data == "reactivate_all":
+            await self.reactivate_all_groups(update, context)
+        elif data == "refresh_groups":
+            await self.refresh_groups(update, context)
         elif data.startswith("remove_group_"):
             chat_id = int(data.split("_")[2])
             await self.remove_group(update, context, chat_id)
@@ -550,8 +849,8 @@ class QuizBot:
     
     async def remove_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         """Remove a group from the list"""
-        self.groups = [g for g in self.groups if g['chat_id'] != chat_id]
-        self.save_data(GROUPS_FILE, self.groups)
+        self.mongo.delete_one('groups', {'chat_id': chat_id})
+        self.groups = self.load_groups()
         
         await update.callback_query.edit_message_text(
             f"✅ Group removed from database.\n\n"
@@ -560,20 +859,23 @@ class QuizBot:
     
     async def show_group_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         """Show statistics for a specific group"""
-        group = next((g for g in self.groups if g['chat_id'] == chat_id), None)
+        group = self.mongo.find_one('groups', {'chat_id': chat_id})
         
         if not group:
             await update.callback_query.answer("Group not found!")
             return
+        
+        status = "🟢 Active" if group.get('is_active', True) else "🔴 Inactive"
         
         stats_text = (
             f"📊 **Group Statistics**\n\n"
             f"🏷️ **Name:** {group['title']}\n"
             f"🆔 **ID:** {group['chat_id']}\n"
             f"📅 **Added:** {datetime.fromisoformat(group['added_date']).strftime('%Y-%m-%d')}\n"
-            f"📤 **Quizzes Received:** {group['quizzes_received']}\n"
+            f"📤 **Quizzes Received:** {group.get('quizzes_received', 0)}\n"
             f"👥 **Members:** {group.get('member_count', 'Unknown')}\n"
             f"🕐 **Last Activity:** {datetime.fromisoformat(group['last_activity']).strftime('%Y-%m-%d %H:%M')}\n"
+            f"📊 **Status:** {status}\n"
         )
         
         keyboard = [
@@ -588,9 +890,11 @@ class QuizBot:
         """Setup bot handlers"""
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("stats", self.show_stats))
+        self.application.add_handler(CommandHandler("settings", self.show_settings))
         self.application.add_handler(CommandHandler("broadcast", self.start_broadcast))
         self.application.add_handler(CommandHandler("export", self.export_data))
         self.application.add_handler(CommandHandler("groups", self.manage_groups))
+        self.application.add_handler(CommandHandler("setdelay", self.set_quiz_interval))
         
         # Handle both text messages and polls
         self.application.add_handler(MessageHandler(
@@ -598,12 +902,18 @@ class QuizBot:
             self.handle_private_message
         ))
         
+        # Handle interval input
+        self.application.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            self.handle_interval_input
+        ))
+        
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
     
     async def start_scheduler(self):
         """Start the quiz scheduler"""
         while True:
-            await asyncio.sleep(3600)  # Wait 1 hour
+            await asyncio.sleep(self.quiz_interval)  # Use configurable interval
             await self.send_random_quiz()
     
     async def run_bot(self):
@@ -619,7 +929,10 @@ class QuizBot:
         await self.application.start()
         await self.application.updater.start_polling()
         
-        print("✅ Bot is now running with poll quiz support!")
+        quiz_interval_hours = self.quiz_interval / 3600
+        print(f"✅ Bot is now running with MongoDB support!")
+        print(f"⏰ Quiz interval: {quiz_interval_hours} hours")
+        print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
         
         # Keep the bot running
         while True:
@@ -631,7 +944,7 @@ def run_flask():
     
     @app.route('/')
     def home():
-        return "Quiz Poll Bot is running!"
+        return "Quiz Poll Bot is running with MongoDB!"
     
     @app.route('/health')
     def health():
