@@ -3,11 +3,10 @@ import json
 import random
 import asyncio
 import csv
-import signal
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import aiohttp
-from aiohttp import web
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -23,6 +22,17 @@ PORT = int(os.getenv('PORT', 10000))
 QUIZZES_FILE = 'quizzes.json'
 GROUPS_FILE = 'groups.json'
 STATS_FILE = 'bot_stats.json'
+
+# Create Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Quiz Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
 
 class QuizBot:
     def __init__(self):
@@ -573,7 +583,7 @@ class QuizBot:
             await self.send_random_quiz()
     
     async def start_bot(self):
-        """Start the bot with proper event loop handling"""
+        """Start the bot"""
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
@@ -584,57 +594,30 @@ class QuizBot:
         print("🤖 Bot is running with enhanced features...")
         await self.application.run_polling()
 
-    async def stop_bot(self):
-        """Stop the bot gracefully"""
-        if self.scheduler_task:
-            self.scheduler_task.cancel()
-        if self.application:
-            await self.application.stop()
-            await self.application.shutdown()
+def run_flask():
+    """Run Flask app in a separate thread"""
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
-# Web server for Render.com
-async def handle_health_check(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    """Start the web server for health checks"""
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    app.router.add_get('/health', handle_health_check)
+def main():
+    """Main function to run both bot and Flask server"""
+    # Start Flask in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"🌐 Flask server running on port {PORT}")
     
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"🌐 Web server running on port {PORT}")
-    return runner
-
-async def main():
-    """Main function to run both bot and web server"""
+    # Create and run the bot
     bot = QuizBot()
     
-    # Start web server
-    runner = await start_web_server()
-    
-    try:
-        # Start the bot (this will block until the bot is stopped)
-        await bot.start_bot()
-    except KeyboardInterrupt:
-        print("Received stop signal, shutting down...")
-    finally:
-        # Cleanup
-        await bot.stop_bot()
-        await runner.cleanup()
-        print("Bot stopped gracefully")
-
-if __name__ == '__main__':
-    # Set up signal handlers for graceful shutdown
+    # Run the bot in the main thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        loop.run_until_complete(main())
+        loop.run_until_complete(bot.start_bot())
     except KeyboardInterrupt:
-        print("Shutting down...")
+        print("Bot stopped by user")
     finally:
         loop.close()
+
+if __name__ == '__main__':
+    main()
