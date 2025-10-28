@@ -142,7 +142,8 @@ class QuizBot:
                 'bot_start_time': datetime.now().isoformat(),
                 'last_quiz_sent': None,
                 'group_engagement': {},
-                'total_broadcasts_sent': 0
+                'total_broadcasts_sent': 0,
+                'manual_quizzes_sent': 0
             }
             self.mongo.insert_one('stats', stats)
         return stats
@@ -208,7 +209,9 @@ class QuizBot:
             else:
                 await update.message.reply_text(
                     "👋 Hello! I'm a quiz bot that sends random poll quizzes regularly.\n\n"
-                    "Add me to your group and make me an admin to start receiving fun quiz polls!"
+                    "Add me to your group and make me an admin to start receiving fun quiz polls!\n\n"
+                    "⚡ **Group Commands:**\n"
+                    "• /rquiz - Send immediate random quiz (Group admins only)"
                 )
         else:
             # Bot added to a group
@@ -228,6 +231,7 @@ class QuizBot:
             'added_date': datetime.now().isoformat(),
             'member_count': update.effective_chat.get_member_count() if update.effective_chat.get_member_count else 0,
             'quizzes_received': existing_group['quizzes_received'] if existing_group else 0,
+            'manual_quizzes_received': existing_group['manual_quizzes_received'] if existing_group else 0,
             'last_activity': datetime.now().isoformat(),
             'is_active': True
         }
@@ -236,11 +240,11 @@ class QuizBot:
             # Update existing group
             group_info['_id'] = existing_group['_id']
             self.mongo.replace_one('groups', {'_id': existing_group['_id']}, group_info)
-            message = f"🎉 I'm back in {chat_title}! I'll continue sending quiz polls."
+            message = f"🎉 I'm back in {chat_title}! I'll continue sending quiz polls.\n\nUse /rquiz to send an immediate quiz!"
         else:
             # Add new group
             self.mongo.insert_one('groups', group_info)
-            message = f"🎉 Thanks for adding me to {chat_title}!\n\nI'll send random quiz polls automatically!"
+            message = f"🎉 Thanks for adding me to {chat_title}!\n\nI'll send random quiz polls automatically!\n\nUse /rquiz to send an immediate quiz!"
         
         # Reload groups from MongoDB
         self.groups = self.load_groups()
@@ -295,6 +299,7 @@ class QuizBot:
             'correct_option_id': poll.correct_option_id if hasattr(poll, 'correct_option_id') else None,
             'added_date': datetime.now().isoformat(),
             'sent_count': 0,
+            'manual_sent_count': 0,
             'last_sent': None,
             'engagement': 0,
             'is_active': True
@@ -317,7 +322,8 @@ class QuizBot:
             f"👤 **Voting:** Non-anonymous (voters visible)\n"
             f"📊 Total quizzes: {len(self.quizzes)}\n"
             f"👥 Will be sent to: {len(self.groups)} groups\n"
-            f"⏰ Next quiz in: {self.quiz_interval / 3600} hours"
+            f"⏰ Next quiz in: {self.quiz_interval / 3600} hours\n\n"
+            f"💡 Group admins can use /rquiz to send immediate quizzes!"
         )
     
     async def send_random_quiz(self):
@@ -333,7 +339,7 @@ class QuizBot:
         quiz = random.choice(active_quizzes)
         
         # Update quiz stats
-        quiz['sent_count'] += 1
+        quiz['sent_count'] = quiz.get('sent_count', 0) + 1
         quiz['last_sent'] = datetime.now().isoformat()
         self.save_quiz(quiz)
         
@@ -347,30 +353,7 @@ class QuizBot:
         
         for group in active_groups:
             try:
-                if quiz['type'] == 'poll':
-                    # Send as poll with non-anonymous voting
-                    message = await self.application.bot.send_poll(
-                        chat_id=group['chat_id'],
-                        question=f"🎯 Quiz Time: {quiz['question']}",
-                        options=quiz['options'],
-                        is_anonymous=False,  # Force non-anonymous voting
-                        allows_multiple_answers=quiz.get('allows_multiple_answers', False),
-                        type=Poll.QUIZ if quiz.get('correct_option_id') is not None else Poll.REGULAR,
-                        correct_option_id=quiz.get('correct_option_id'),
-                        explanation="Check back later for results!",
-                        open_period=0,  # No time limit
-                    )
-                
-                # Update group stats
-                group['quizzes_received'] = group.get('quizzes_received', 0) + 1
-                group['last_activity'] = datetime.now().isoformat()
-                self.save_group(group)
-                
-                # Track engagement
-                if str(group['chat_id']) not in self.stats['group_engagement']:
-                    self.stats['group_engagement'][str(group['chat_id'])] = 0
-                self.stats['group_engagement'][str(group['chat_id'])] += 1
-                
+                await self.send_quiz_to_group(group, quiz)
                 sent_to += 1
                 await asyncio.sleep(0.5)  # Rate limiting
                 
@@ -386,6 +369,114 @@ class QuizBot:
         
         print(f"📤 Sent quiz poll to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
     
+    async def send_quiz_to_group(self, group, quiz):
+        """Send a quiz to a specific group"""
+        if quiz['type'] == 'poll':
+            # Send as poll with non-anonymous voting
+            message = await self.application.bot.send_poll(
+                chat_id=group['chat_id'],
+                question=f"🎯 Quiz Time: {quiz['question']}",
+                options=quiz['options'],
+                is_anonymous=False,  # Force non-anonymous voting
+                allows_multiple_answers=quiz.get('allows_multiple_answers', False),
+                type=Poll.QUIZ if quiz.get('correct_option_id') is not None else Poll.REGULAR,
+                correct_option_id=quiz.get('correct_option_id'),
+                explanation="Check back later for results!",
+                open_period=0,  # No time limit
+            )
+        
+        # Update group stats
+        group['quizzes_received'] = group.get('quizzes_received', 0) + 1
+        group['last_activity'] = datetime.now().isoformat()
+        self.save_group(group)
+        
+        # Track engagement
+        if str(group['chat_id']) not in self.stats['group_engagement']:
+            self.stats['group_engagement'][str(group['chat_id'])] = 0
+        self.stats['group_engagement'][str(group['chat_id'])] += 1
+    
+    async def send_immediate_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /rquiz command - send immediate random quiz to current group"""
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        
+        # Check if it's a group chat
+        if update.effective_chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text("❌ This command can only be used in groups!")
+            return
+        
+        # Check if user is admin of the group or bot admin
+        is_admin = False
+        
+        # Check if user is bot admin
+        if user_id == ADMIN_USER_ID:
+            is_admin = True
+        else:
+            # Check if user is admin in the group
+            try:
+                chat_member = await context.bot.get_chat_member(chat_id, user_id)
+                if chat_member.status in ['administrator', 'creator']:
+                    is_admin = True
+            except Exception as e:
+                print(f"Error checking admin status: {e}")
+        
+        if not is_admin:
+            await update.message.reply_text("❌ Only group admins can use this command!")
+            return
+        
+        # Check if there are active quizzes
+        active_quizzes = [q for q in self.quizzes if q.get('is_active', True)]
+        if not active_quizzes:
+            await update.message.reply_text("❌ No quizzes available! Please add some quizzes first.")
+            return
+        
+        # Get the group from database
+        group = self.mongo.find_one('groups', {'chat_id': chat_id})
+        if not group:
+            await update.message.reply_text("❌ This group is not registered with the bot. Please add me to the group first!")
+            return
+        
+        if not group.get('is_active', True):
+            await update.message.reply_text("❌ This group is marked as inactive. Please contact the bot admin.")
+            return
+        
+        # Send typing action
+        await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+        
+        try:
+            # Select random quiz
+            quiz = random.choice(active_quizzes)
+            
+            # Update quiz stats for manual sends
+            quiz['manual_sent_count'] = quiz.get('manual_sent_count', 0) + 1
+            quiz['last_sent'] = datetime.now().isoformat()
+            self.save_quiz(quiz)
+            
+            # Update group stats for manual quizzes
+            group['manual_quizzes_received'] = group.get('manual_quizzes_received', 0) + 1
+            group['last_activity'] = datetime.now().isoformat()
+            self.save_group(group)
+            
+            # Update global stats
+            self.stats['manual_quizzes_sent'] = self.stats.get('manual_quizzes_sent', 0) + 1
+            self.save_stats()
+            
+            # Send the quiz
+            await self.send_quiz_to_group(group, quiz)
+            
+            # Send confirmation message
+            await update.message.reply_text(
+                f"✅ **Random Quiz Sent!**\n\n"
+                f"📝 Question: {quiz['question']}\n"
+                f"🕐 Sent by: {update.effective_user.first_name}\n"
+                f"📊 This quiz has been sent {quiz.get('sent_count', 0)} times automatically "
+                f"and {quiz.get('manual_sent_count', 0)} times manually"
+            )
+            
+        except Exception as e:
+            print(f"Error sending immediate quiz: {e}")
+            await update.message.reply_text("❌ Failed to send quiz. Please try again later.")
+    
     async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show detailed bot statistics"""
         user_id = update.effective_user.id
@@ -398,6 +489,7 @@ class QuizBot:
         total_groups = len(self.groups)
         total_quizzes_sent = self.stats['total_quizzes_sent']
         quizzes_added = self.stats['quizzes_added']
+        manual_quizzes_sent = self.stats.get('manual_quizzes_sent', 0)
         active_groups_count = len([g for g in self.groups if g.get('is_active', True)])
         
         # Calculate active groups (active in last 7 days)
@@ -429,7 +521,8 @@ class QuizBot:
             f"   • Total groups: {total_groups}\n"
             f"   • Active groups: {active_groups_count}\n"
             f"   • Recently active: {recently_active}\n"
-            f"   • Total quizzes sent: {total_quizzes_sent}\n\n"
+            f"   • Total quizzes sent: {total_quizzes_sent}\n"
+            f"   • Manual quizzes sent: {manual_quizzes_sent}\n\n"
             
             f"⏰ **Performance**\n"
             f"   • Bot started: {datetime.fromisoformat(self.stats['bot_start_time']).strftime('%Y-%m-%d %H:%M')}\n"
@@ -472,8 +565,10 @@ class QuizBot:
             f"📊 **Database**: {'MongoDB' if self.mongo.db else 'In-Memory'}\n"
             f"   - Data persistence status\n\n"
             f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
-            f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n\n"
-            f"💡 Use /setdelay <hours> to change the quiz interval"
+            f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n"
+            f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n\n"
+            f"💡 Use /setdelay <hours> to change the quiz interval\n"
+            f"💡 Group admins can use /rquiz for immediate quizzes"
         )
         
         keyboard = [
@@ -625,7 +720,7 @@ class QuizBot:
             # Export quizzes to CSV
             if self.quizzes:
                 with open('quizzes_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['_id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'correct_option_id', 'added_date', 'sent_count', 'last_sent', 'is_active']
+                    fieldnames = ['_id', 'type', 'question', 'options', 'is_anonymous', 'allows_multiple_answers', 'correct_option_id', 'added_date', 'sent_count', 'manual_sent_count', 'last_sent', 'is_active']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for quiz in self.quizzes:
@@ -645,7 +740,7 @@ class QuizBot:
             # Export groups to CSV
             if self.groups:
                 with open('groups_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['_id', 'chat_id', 'title', 'added_date', 'member_count', 'quizzes_received', 'last_activity', 'is_active']
+                    fieldnames = ['_id', 'chat_id', 'title', 'added_date', 'member_count', 'quizzes_received', 'manual_quizzes_received', 'last_activity', 'is_active']
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     for group in self.groups:
@@ -720,7 +815,7 @@ class QuizBot:
         if sorted_groups:
             groups_text += "🏆 **Top 5 Active Groups:**\n"
             for i, group in enumerate(sorted_groups, 1):
-                groups_text += f"{i}. {group['title']} - {group.get('quizzes_received', 0)} quizzes\n"
+                groups_text += f"{i}. {group['title']} - {group.get('quizzes_received', 0)} auto + {group.get('manual_quizzes_received', 0)} manual quizzes\n"
         
         keyboard = [
             [InlineKeyboardButton("🔄 Refresh", callback_data="manage_groups")],
@@ -818,7 +913,8 @@ class QuizBot:
                 "4. (Optional) Enable 'Quiz Mode' for correct answers\n"
                 "5. Send the poll to me\n\n"
                 "📢 **Important:** All quizzes will show who voted for what (non-anonymous voting)\n\n"
-                "I'll automatically save it and send it to groups every hour!"
+                "I'll automatically save it and send it to groups!\n\n"
+                "💡 Group admins can use /rquiz for immediate quizzes"
             )
         elif data == "settings":
             await self.show_settings(update, context)
@@ -872,7 +968,8 @@ class QuizBot:
             f"🏷️ **Name:** {group['title']}\n"
             f"🆔 **ID:** {group['chat_id']}\n"
             f"📅 **Added:** {datetime.fromisoformat(group['added_date']).strftime('%Y-%m-%d')}\n"
-            f"📤 **Quizzes Received:** {group.get('quizzes_received', 0)}\n"
+            f"📤 **Auto Quizzes Received:** {group.get('quizzes_received', 0)}\n"
+            f"🎯 **Manual Quizzes Received:** {group.get('manual_quizzes_received', 0)}\n"
             f"👥 **Members:** {group.get('member_count', 'Unknown')}\n"
             f"🕐 **Last Activity:** {datetime.fromisoformat(group['last_activity']).strftime('%Y-%m-%d %H:%M')}\n"
             f"📊 **Status:** {status}\n"
@@ -895,6 +992,7 @@ class QuizBot:
         self.application.add_handler(CommandHandler("export", self.export_data))
         self.application.add_handler(CommandHandler("groups", self.manage_groups))
         self.application.add_handler(CommandHandler("setdelay", self.set_quiz_interval))
+        self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
         
         # Handle both text messages and polls
         self.application.add_handler(MessageHandler(
@@ -933,6 +1031,7 @@ class QuizBot:
         print(f"✅ Bot is now running with MongoDB support!")
         print(f"⏰ Quiz interval: {quiz_interval_hours} hours")
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
+        print(f"🎯 /rquiz command enabled for group admins")
         
         # Keep the bot running
         while True:
