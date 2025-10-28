@@ -178,6 +178,28 @@ class QuizBot:
     def save_stats(self):
         """Save stats to MongoDB"""
         self.mongo.replace_one('stats', {'_id': 'bot_stats'}, self.stats)
+
+    async def ensure_group_registered(self, chat_id, chat_title=None):
+        """Ensure a group is registered in the database"""
+        existing_group = self.mongo.find_one('groups', {'chat_id': chat_id})
+        
+        if not existing_group:
+            # Register the group
+            group_info = {
+                'chat_id': chat_id,
+                'title': chat_title or f"Group {chat_id}",
+                'added_date': datetime.now().isoformat(),
+                'member_count': 0,
+                'quizzes_received': 0,
+                'manual_quizzes_received': 0,
+                'last_activity': datetime.now().isoformat(),
+                'is_active': True
+            }
+            self.mongo.insert_one('groups', group_info)
+            self.groups = self.load_groups()  # Reload groups
+            print(f"✅ Auto-registered group: {chat_title or chat_id}")
+        
+        return self.mongo.find_one('groups', {'chat_id': chat_id})
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -403,6 +425,7 @@ class QuizBot:
         """Handle /rquiz command - send immediate random quiz to current group"""
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
+        chat_title = update.effective_chat.title
         
         # Check if it's a group chat
         if update.effective_chat.type not in ['group', 'supergroup']:
@@ -434,15 +457,16 @@ class QuizBot:
             await update.message.reply_text("❌ No quizzes available! Please add some quizzes first.")
             return
         
-        # Get the group from database
-        group = self.mongo.find_one('groups', {'chat_id': chat_id})
+        # Ensure group is registered (auto-register if not)
+        group = await self.ensure_group_registered(chat_id, chat_title)
         if not group:
-            await update.message.reply_text("❌ This group is not registered with the bot. Please add me to the group first!")
+            await update.message.reply_text("❌ Failed to register group. Please try again.")
             return
         
         if not group.get('is_active', True):
-            await update.message.reply_text("❌ This group is marked as inactive. Please contact the bot admin.")
-            return
+            # Reactivate the group
+            group['is_active'] = True
+            self.save_group(group)
         
         # Send typing action
         await context.bot.send_chat_action(chat_id=chat_id, action='typing')
@@ -588,8 +612,49 @@ class QuizBot:
         else:
             await update.message.reply_text(settings_text, reply_markup=reply_markup)
     
-    async def set_quiz_interval(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Set quiz interval from callback"""
+    async def set_quiz_interval_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /setdelay command directly"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("This command is for admin only.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Please specify the interval in hours.\n\n"
+                "Usage: /setdelay <hours>\n"
+                "Example: /setdelay 2 (for 2 hours)\n"
+                "Example: /setdelay 0.5 (for 30 minutes)\n\n"
+                f"Current interval: {self.quiz_interval / 3600} hours"
+            )
+            return
+        
+        try:
+            hours = float(context.args[0])
+            if hours <= 0:
+                await update.message.reply_text("❌ Interval must be greater than 0 hours.")
+                return
+            
+            new_interval = int(hours * 3600)  # Convert to seconds
+            old_interval = self.quiz_interval
+            
+            self.quiz_interval = new_interval
+            self.settings['quiz_interval'] = new_interval
+            self.save_settings()
+            
+            await update.message.reply_text(
+                f"✅ **Quiz interval updated!**\n\n"
+                f"📅 Old interval: {old_interval / 3600} hours\n"
+                f"📅 New interval: {hours} hours\n\n"
+                f"Next quiz will be sent in approximately {hours} hours."
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Please enter a valid number (e.g., 2 for 2 hours, 0.5 for 30 minutes)")
+    
+    async def set_quiz_interval_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set quiz interval from callback (settings menu)"""
         user_id = update.effective_user.id
         
         if user_id != ADMIN_USER_ID:
@@ -607,7 +672,7 @@ class QuizBot:
         context.user_data['waiting_for_interval'] = True
     
     async def handle_interval_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle quiz interval input"""
+        """Handle quiz interval input from settings menu"""
         user_id = update.effective_user.id
         
         if user_id != ADMIN_USER_ID or not context.user_data.get('waiting_for_interval'):
@@ -929,7 +994,7 @@ class QuizBot:
         elif data == "export_data":
             await self.export_data(update, context)
         elif data == "set_interval":
-            await self.set_quiz_interval(update, context)
+            await self.set_quiz_interval_callback(update, context)
         elif data == "cancel_broadcast":
             user_id = query.from_user.id
             self.broadcast_mode[user_id] = False
@@ -995,7 +1060,7 @@ class QuizBot:
         self.application.add_handler(CommandHandler("broadcast", self.start_broadcast))
         self.application.add_handler(CommandHandler("export", self.export_data))
         self.application.add_handler(CommandHandler("groups", self.manage_groups))
-        self.application.add_handler(CommandHandler("setdelay", self.set_quiz_interval))
+        self.application.add_handler(CommandHandler("setdelay", self.set_quiz_interval_command))
         self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
         
         # Handle both text messages and polls
@@ -1004,7 +1069,7 @@ class QuizBot:
             self.handle_private_message
         ))
         
-        # Handle interval input
+        # Handle interval input from settings menu
         self.application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             self.handle_interval_input
