@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  quiz-bot:
+    build: .
+    container_name: telegram-quiz-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "10000:10000"
+    volumes:
+      - bot_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  bot_data:
