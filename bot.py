@@ -23,16 +23,8 @@ QUIZZES_FILE = 'quizzes.json'
 GROUPS_FILE = 'groups.json'
 STATS_FILE = 'bot_stats.json'
 
-# Create Flask app
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Quiz Bot is running!"
-
-@app.route('/health')
-def health():
-    return "OK", 200
+# Global bot instance
+bot_instance = None
 
 class QuizBot:
     def __init__(self):
@@ -47,7 +39,7 @@ class QuizBot:
             'last_quiz_sent': None,
             'group_engagement': {}
         })
-        self.broadcast_mode = {}  # Track users in broadcast mode
+        self.broadcast_mode = {}
         self.scheduler_task = None
         
     def load_data(self, filename, default):
@@ -200,7 +192,7 @@ class QuizBot:
         sent_to = 0
         for group in self.groups:
             try:
-                message = await self.application.bot.send_message(
+                await self.application.bot.send_message(
                     chat_id=group['chat_id'],
                     text=f"🎯 **Random Quiz!**\n\n{quiz_text}\n\n"
                          f"💬 Discuss your answers in the group!\n"
@@ -211,7 +203,7 @@ class QuizBot:
                 group['quizzes_received'] += 1
                 group['last_activity'] = datetime.now().isoformat()
                 
-                # Track engagement (you could add reaction tracking here)
+                # Track engagement
                 if str(group['chat_id']) not in self.stats['group_engagement']:
                     self.stats['group_engagement'][str(group['chat_id'])] = 0
                 self.stats['group_engagement'][str(group['chat_id'])] += 1
@@ -582,42 +574,65 @@ class QuizBot:
             await asyncio.sleep(3600)  # Wait 1 hour
             await self.send_random_quiz()
     
-    async def start_bot(self):
-        """Start the bot"""
+    async def run_bot(self):
+        """Run the bot"""
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_handlers()
         
-        # Start the scheduler in background
-        self.scheduler_task = asyncio.create_task(self.start_scheduler())
+        # Start the scheduler
+        asyncio.create_task(self.start_scheduler())
         
-        # Start the bot
-        print("🤖 Bot is running with enhanced features...")
-        await self.application.run_polling()
+        print("🤖 Bot is starting...")
+        await self.application.initialize()
+        await self.application.start()
+        await self.application.updater.start_polling()
+        
+        print("✅ Bot is now running!")
+        
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)
 
 def run_flask():
-    """Run Flask app in a separate thread"""
+    """Run Flask app"""
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def home():
+        return "Quiz Bot is running!"
+    
+    @app.route('/health')
+    def health():
+        return "OK", 200
+    
+    print(f"🌐 Flask server starting on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
-def main():
-    """Main function to run both bot and Flask server"""
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print(f"🌐 Flask server running on port {PORT}")
-    
-    # Create and run the bot
-    bot = QuizBot()
-    
-    # Run the bot in the main thread
+def run_bot():
+    """Run the bot in its own thread"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
+    global bot_instance
+    bot_instance = QuizBot()
+    
     try:
-        loop.run_until_complete(bot.start_bot())
+        loop.run_until_complete(bot_instance.run_bot())
     except KeyboardInterrupt:
         print("Bot stopped by user")
+    except Exception as e:
+        print(f"Bot error: {e}")
     finally:
         loop.close()
+
+def main():
+    """Main function to start both services"""
+    # Start Flask in main thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Start bot in current thread (this will block)
+    run_bot()
 
 if __name__ == '__main__':
     main()
