@@ -115,6 +115,8 @@ class QuizBot:
         self.broadcast_mode = {}
         self.scheduler_task = None
         self.quiz_interval = self.settings.get('quiz_interval', 3600)  # Default 1 hour
+        self.recently_sent_quizzes = []  # Track recently sent quiz IDs
+        self.max_recent_track = 10  # Keep track of last 10 sent quizzes
         
     def load_quizzes(self):
         """Load quizzes from MongoDB"""
@@ -188,8 +190,8 @@ class QuizBot:
         """Save stats to MongoDB"""
         self.mongo.replace_one('stats', {'_id': 'bot_stats'}, self.stats)
 
-    def get_random_quiz(self, exclude_recent_count=5):
-        """Get a random quiz that hasn't been sent recently"""
+    def get_random_quiz(self, exclude_recent_count=8):
+        """Get a random quiz that hasn't been sent recently - IMPROVED ANTI-REPEAT"""
         if not self.quizzes:
             return None
         
@@ -198,31 +200,48 @@ class QuizBot:
         if not active_quizzes:
             return None
         
+        print(f"🔍 Available quizzes: {len(active_quizzes)}, Recently sent: {len(self.recently_sent_quizzes)}")
+        
         # If we have very few quizzes, just return a random one
-        if len(active_quizzes) <= exclude_recent_count:
-            return random.choice(active_quizzes)
+        if len(active_quizzes) <= 3:
+            quiz = random.choice(active_quizzes)
+            print(f"📝 Few quizzes available, selected: {quiz['question'][:50]}...")
+            return quiz
         
-        # Get recently sent quizzes (sorted by last_sent, most recent first)
-        recently_sent = sorted(
-            [q for q in active_quizzes if q.get('last_sent')],
-            key=lambda x: x.get('last_sent', ''),
-            reverse=True
-        )[:exclude_recent_count]
-        
-        # Extract IDs of recently sent quizzes
-        recent_ids = [q['_id'] for q in recently_sent if '_id' in q]
+        # Remove old entries from recently_sent_quizzes if it gets too large
+        if len(self.recently_sent_quizzes) > self.max_recent_track:
+            self.recently_sent_quizzes = self.recently_sent_quizzes[-self.max_recent_track:]
         
         # Get quizzes that haven't been sent recently
-        available_quizzes = [q for q in active_quizzes if q['_id'] not in recent_ids]
+        available_quizzes = [q for q in active_quizzes if q['_id'] not in self.recently_sent_quizzes]
         
-        # If no available quizzes (all were sent recently), return least recently sent
+        # If no available quizzes (all were sent recently), use least recently sent
         if not available_quizzes:
+            print("🔄 All quizzes recently sent, using least recent ones")
+            # Sort by last_sent date (oldest first)
             available_quizzes = sorted(
                 active_quizzes,
-                key=lambda x: x.get('last_sent', '2000-01-01')  # Old dates first
+                key=lambda x: x.get('last_sent', '2000-01-01')
             )
         
-        return random.choice(available_quizzes)
+        # If still no quizzes, return random
+        if not available_quizzes:
+            quiz = random.choice(active_quizzes)
+        else:
+            quiz = random.choice(available_quizzes)
+        
+        print(f"🎯 Selected quiz: {quiz['question'][:50]}...")
+        return quiz
+
+    def track_recent_quiz(self, quiz_id):
+        """Track a quiz as recently sent"""
+        if quiz_id in self.recently_sent_quizzes:
+            self.recently_sent_quizzes.remove(quiz_id)
+        self.recently_sent_quizzes.append(quiz_id)
+        
+        # Keep only recent ones
+        if len(self.recently_sent_quizzes) > self.max_recent_track:
+            self.recently_sent_quizzes = self.recently_sent_quizzes[-self.max_recent_track:]
 
     async def ensure_group_registered(self, chat_id, chat_title=None):
         """Ensure a group is registered in the database"""
@@ -371,6 +390,11 @@ class QuizBot:
             await self.handle_explanation_input(update, context)
             return
         
+        # Check if user is setting interval
+        if context.user_data.get('waiting_for_interval'):
+            await self.handle_interval_input(update, context)
+            return
+        
         # Check if it's a poll
         if update.message.poll:
             await self.save_poll_quiz(update, update.message.poll)
@@ -384,11 +408,12 @@ class QuizBot:
                 "4. ✅ Enable 'Quiz Mode' and set the correct answer\n"
                 "5. Send it to me\n\n"
                 "I'll automatically save it as a quiz!\n\n"
-                "📝 Note: Only QUIZ MODE polls are accepted (with correct answers)"
+                "📝 Note: Only QUIZ MODE polls are accepted (with correct answers)\n"
+                "👤 Note: I accept both anonymous and non-anonymous QUIZ MODE polls, but will always send as NON-ANONYMOUS"
             )
     
     async def save_poll_quiz(self, update: Update, poll):
-        """Save a poll as a quiz - ONLY QUIZ MODE POLLS"""
+        """Save a poll as a quiz - BOTH ANONYMOUS AND NON-ANONYMOUS QUIZ MODE POLLS ARE ACCEPTED"""
         # Check if it's a quiz mode poll (has correct_option_id)
         if poll.correct_option_id is None:
             await update.message.reply_text(
@@ -397,7 +422,8 @@ class QuizBot:
                 "Please create a new poll and make sure to:\n"
                 "1. Enable 'Quiz Mode'\n"
                 "2. Set the correct answer\n"
-                "3. Then send it to me"
+                "3. Then send it to me\n\n"
+                "📝 I accept both anonymous and non-anonymous QUIZ MODE polls!"
             )
             return
         
@@ -405,7 +431,7 @@ class QuizBot:
             'type': 'quiz',
             'question': poll.question,
             'options': [option.text for option in poll.options],
-            'is_anonymous': False,  # Force non-anonymous voting
+            'is_anonymous': poll.is_anonymous,  # Keep original setting for reference
             'allows_multiple_answers': False,  # Quiz mode doesn't allow multiple answers
             'correct_option_id': poll.correct_option_id,
             'added_date': datetime.now().isoformat(),
@@ -426,34 +452,41 @@ class QuizBot:
         # Format options for display
         options_text = "\n".join([f"• {option}" for option in quiz['options']])
         correct_answer = quiz['options'][quiz['correct_option_id']]
+        anonymous_status = "Anonymous" if quiz['is_anonymous'] else "Non-anonymous"
         
         await update.message.reply_text(
             f"✅ **Quiz Saved Successfully!**\n\n"
             f"📝 **Question:** {quiz['question']}\n\n"
             f"📋 **Options:**\n{options_text}\n\n"
             f"✅ **Correct Answer:** {correct_answer}\n"
-            f"👤 **Voting:** Non-anonymous (voters visible)\n"
+            f"👤 **Original Setting:** {anonymous_status}\n"
             f"📊 Total quizzes: {len(self.quizzes)}\n"
             f"👥 Will be sent to: {len(self.groups)} groups\n"
             f"⏰ Next quiz in: {self.quiz_interval / 3600} hours\n\n"
+            f"💡 Note: When sent to groups, quizzes will always be NON-ANONYMOUS (voters visible)\n"
             f"💡 Group admins can use /rquiz to send immediate quizzes!"
         )
     
     async def send_random_quiz(self):
         """Send a random quiz poll to all groups"""
         if not self.quizzes or not self.groups:
+            print("❌ No quizzes or groups available")
             return
         
         # Get a random quiz that hasn't been sent recently
-        quiz = self.get_random_quiz(exclude_recent_count=5)  # Avoid last 5 sent quizzes
+        quiz = self.get_random_quiz(exclude_recent_count=8)  # Avoid last 8 sent quizzes
         
         if not quiz:
+            print("❌ No quiz selected")
             return
         
         # Update quiz stats
         quiz['sent_count'] = quiz.get('sent_count', 0) + 1
         quiz['last_sent'] = datetime.now().isoformat()
         self.save_quiz(quiz)
+        
+        # Track as recently sent
+        self.track_recent_quiz(quiz['_id'])
         
         # Update global stats
         self.stats['total_quizzes_sent'] += len(self.groups)
@@ -463,6 +496,8 @@ class QuizBot:
         sent_to = 0
         active_groups = [g for g in self.groups if g.get('is_active', True)]
         
+        print(f"📤 Sending quiz to {len(active_groups)} active groups: {quiz['question'][:50]}...")
+        
         for group in active_groups:
             try:
                 await self.send_quiz_to_group(group, quiz)
@@ -470,7 +505,7 @@ class QuizBot:
                 await asyncio.sleep(0.5)  # Rate limiting
                 
             except Exception as e:
-                print(f"Failed to send to group {group['chat_id']}: {e}")
+                print(f"❌ Failed to send to group {group['chat_id']}: {e}")
                 # Mark group as inactive if sending fails repeatedly
                 group['is_active'] = False
                 self.save_group(group)
@@ -479,19 +514,20 @@ class QuizBot:
         self.groups = self.load_groups()
         self.save_stats()
         
-        print(f"📤 Sent quiz '{quiz['question'][:30]}...' to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
+        print(f"✅ Sent quiz '{quiz['question'][:30]}...' to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
+        print(f"📊 Recent quizzes tracking: {len(self.recently_sent_quizzes)} quizzes")
     
     async def send_quiz_to_group(self, group, quiz):
-        """Send a quiz to a specific group"""
+        """Send a quiz to a specific group - ALWAYS NON-ANONYMOUS"""
         explanation = self.settings.get('quiz_explanation', "Check back later for results!")
         
         if quiz['type'] == 'quiz':
-            # Send as QUIZ MODE poll with non-anonymous voting
+            # Send as QUIZ MODE poll with NON-ANONYMOUS voting (ALWAYS)
             message = await self.application.bot.send_poll(
                 chat_id=group['chat_id'],
                 question=f"🎯 Quiz Time: {quiz['question']}",
                 options=quiz['options'],
-                is_anonymous=False,  # Force non-anonymous voting
+                is_anonymous=False,  # ALWAYS force non-anonymous voting
                 allows_multiple_answers=False,  # Quiz mode doesn't allow multiple answers
                 type=Poll.QUIZ,  # Always QUIZ mode
                 correct_option_id=quiz['correct_option_id'],
@@ -561,12 +597,15 @@ class QuizBot:
         
         try:
             # Select random quiz using the same anti-repeat logic
-            quiz = self.get_random_quiz(exclude_recent_count=3)  # Slightly less strict for manual sends
+            quiz = self.get_random_quiz(exclude_recent_count=5)  # Slightly less strict for manual sends
             
             # Update quiz stats for manual sends
             quiz['manual_sent_count'] = quiz.get('manual_sent_count', 0) + 1
             quiz['last_sent'] = datetime.now().isoformat()
             self.save_quiz(quiz)
+            
+            # Track as recently sent
+            self.track_recent_quiz(quiz['_id'])
             
             # Update group stats for manual quizzes
             group['manual_quizzes_received'] = group.get('manual_quizzes_received', 0) + 1
@@ -611,6 +650,7 @@ class QuizBot:
         
         # Reset quizzes list
         self.quizzes = []
+        self.recently_sent_quizzes = []  # Clear recent tracking
         
         # Reset quiz stats
         self.stats['quizzes_added'] = 0
@@ -661,6 +701,7 @@ class QuizBot:
         
         # Reset quizzes list
         self.quizzes = []
+        self.recently_sent_quizzes = []  # Clear recent tracking
         
         # Reset quiz stats
         self.stats['quizzes_added'] = 0
@@ -709,7 +750,7 @@ class QuizBot:
         user_id = update.effective_user.id
         
         if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+            await update.callback_query.answer("This command is for admin only.")
             return
         
         current_explanation = self.settings.get('quiz_explanation', "Check back later for results!")
@@ -922,7 +963,7 @@ class QuizBot:
         user_id = update.effective_user.id
         
         if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+            await update.callback_query.answer("This command is for admin only.")
             return
         
         await update.callback_query.edit_message_text(
@@ -1270,7 +1311,8 @@ class QuizBot:
                 "4. ✅ **Enable 'Quiz Mode' and set the correct answer**\n"
                 "5. Send the poll to me\n\n"
                 "📢 **Important:** I only accept QUIZ MODE polls (with correct answers)\n"
-                "📢 **Important:** All quizzes will show who voted for what (non-anonymous voting)\n\n"
+                "📢 **Important:** I accept both anonymous and non-anonymous QUIZ MODE polls\n"
+                "📢 **Important:** When sent to groups, quizzes will ALWAYS be NON-ANONYMOUS (voters visible)\n\n"
                 "I'll automatically save it and send it to groups!\n\n"
                 "💡 Group admins can use /rquiz for immediate quizzes"
             )
@@ -1399,7 +1441,9 @@ class QuizBot:
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
         print(f"🎯 /rquiz command enabled for group admins")
         print(f"🔄 /reset command available for admin")
-        print(f"🔄 Anti-repeat system active: Avoids last 5 sent quizzes")
+        print(f"🔄 IMPROVED Anti-repeat system active: Tracks last {self.max_recent_track} sent quizzes")
+        print(f"👤 Quiz acceptance: Both anonymous and non-anonymous QUIZ MODE polls accepted")
+        print(f"📤 Quiz sending: ALWAYS sends as NON-ANONYMOUS (voters visible)")
         
         # Keep the bot running
         while True:
