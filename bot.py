@@ -188,6 +188,42 @@ class QuizBot:
         """Save stats to MongoDB"""
         self.mongo.replace_one('stats', {'_id': 'bot_stats'}, self.stats)
 
+    def get_random_quiz(self, exclude_recent_count=5):
+        """Get a random quiz that hasn't been sent recently"""
+        if not self.quizzes:
+            return None
+        
+        # Get active quizzes only
+        active_quizzes = [q for q in self.quizzes if q.get('is_active', True)]
+        if not active_quizzes:
+            return None
+        
+        # If we have very few quizzes, just return a random one
+        if len(active_quizzes) <= exclude_recent_count:
+            return random.choice(active_quizzes)
+        
+        # Get recently sent quizzes (sorted by last_sent, most recent first)
+        recently_sent = sorted(
+            [q for q in active_quizzes if q.get('last_sent')],
+            key=lambda x: x.get('last_sent', ''),
+            reverse=True
+        )[:exclude_recent_count]
+        
+        # Extract IDs of recently sent quizzes
+        recent_ids = [q['_id'] for q in recently_sent if '_id' in q]
+        
+        # Get quizzes that haven't been sent recently
+        available_quizzes = [q for q in active_quizzes if q['_id'] not in recent_ids]
+        
+        # If no available quizzes (all were sent recently), return least recently sent
+        if not available_quizzes:
+            available_quizzes = sorted(
+                active_quizzes,
+                key=lambda x: x.get('last_sent', '2000-01-01')  # Old dates first
+            )
+        
+        return random.choice(available_quizzes)
+
     async def ensure_group_registered(self, chat_id, chat_title=None):
         """Ensure a group is registered in the database"""
         existing_group = self.mongo.find_one('groups', {'chat_id': chat_id})
@@ -408,12 +444,11 @@ class QuizBot:
         if not self.quizzes or not self.groups:
             return
         
-        # Get active quizzes only
-        active_quizzes = [q for q in self.quizzes if q.get('is_active', True)]
-        if not active_quizzes:
-            return
+        # Get a random quiz that hasn't been sent recently
+        quiz = self.get_random_quiz(exclude_recent_count=5)  # Avoid last 5 sent quizzes
         
-        quiz = random.choice(active_quizzes)
+        if not quiz:
+            return
         
         # Update quiz stats
         quiz['sent_count'] = quiz.get('sent_count', 0) + 1
@@ -444,7 +479,7 @@ class QuizBot:
         self.groups = self.load_groups()
         self.save_stats()
         
-        print(f"📤 Sent quiz poll to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
+        print(f"📤 Sent quiz '{quiz['question'][:30]}...' to {sent_to}/{len(active_groups)} groups at {datetime.now()}")
     
     async def send_quiz_to_group(self, group, quiz):
         """Send a quiz to a specific group"""
@@ -525,8 +560,8 @@ class QuizBot:
         await context.bot.send_chat_action(chat_id=chat_id, action='typing')
         
         try:
-            # Select random quiz
-            quiz = random.choice(active_quizzes)
+            # Select random quiz using the same anti-repeat logic
+            quiz = self.get_random_quiz(exclude_recent_count=3)  # Slightly less strict for manual sends
             
             # Update quiz stats for manual sends
             quiz['manual_sent_count'] = quiz.get('manual_sent_count', 0) + 1
@@ -1364,6 +1399,7 @@ class QuizBot:
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
         print(f"🎯 /rquiz command enabled for group admins")
         print(f"🔄 /reset command available for admin")
+        print(f"🔄 Anti-repeat system active: Avoids last 5 sent quizzes")
         
         # Keep the bot running
         while True:
