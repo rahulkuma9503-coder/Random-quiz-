@@ -1292,6 +1292,292 @@ class QuizBot:
         
         await update.callback_query.answer(f"Groups refreshed! {active_groups} active groups loaded.")
     
+    async def list_groups_with_links(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /grouplist command - list all groups with invite links"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ This command is for admin only.")
+            return
+        
+        if not self.groups:
+            await update.message.reply_text("❌ No groups found in database.")
+            return
+        
+        active_groups = [g for g in self.groups if g.get('is_active', True)]
+        inactive_groups = [g for g in self.groups if not g.get('is_active', True)]
+        
+        # Show loading message
+        loading_msg = await update.message.reply_text("🔄 Fetching group links... This may take a moment.")
+        
+        groups_text = f"👥 **Groups List ({len(self.groups)} total)**\n\n"
+        groups_text += f"🟢 Active: {len(active_groups)}\n"
+        groups_text += f"🔴 Inactive: {len(inactive_groups)}\n\n"
+        
+        all_links_text = "📋 **Group List with Links**\n\n"
+        failed_groups = []
+        success_count = 0
+        
+        # Process groups in batches to avoid rate limiting
+        for i, group in enumerate(self.groups, 1):
+            chat_id = group['chat_id']
+            group_title = group.get('title', f"Group {chat_id}")
+            status = "🟢" if group.get('is_active', True) else "🔴"
+            
+            try:
+                # Try to get invite link (requires bot to have admin permissions)
+                chat = await context.bot.get_chat(chat_id)
+                
+                try:
+                    # Try to create invite link
+                    invite_link_obj = await context.bot.create_chat_invite_link(
+                        chat_id=chat_id,
+                        member_limit=1,
+                        expire_date=datetime.now() + timedelta(days=7)
+                    )
+                    invite_link = invite_link_obj.invite_link
+                    link_text = f"[Join {group_title}]({invite_link})"
+                except Exception as link_error:
+                    # If can't create link, try to export existing link
+                    try:
+                        invite_link = await context.bot.export_chat_invite_link(chat_id)
+                        link_text = f"[Join {group_title}]({invite_link})"
+                    except Exception as export_error:
+                        link_text = "❌ No invite link (bot needs admin)"
+                        invite_link = None
+                
+                # Add to detailed list
+                all_links_text += f"{i}. {status} **{group_title}**\n"
+                all_links_text += f"   • ID: `{chat_id}`\n"
+                all_links_text += f"   • Link: {link_text}\n"
+                all_links_text += f"   • Auto Quizzes: {group.get('quizzes_received', 0)}\n"
+                all_links_text += f"   • Manual Quizzes: {group.get('manual_quizzes_received', 0)}\n"
+                
+                if invite_link:
+                    success_count += 1
+                
+                all_links_text += "\n"
+                
+                # Add to summary text
+                groups_text += f"{i}. {status} **{group_title}**\n"
+                if invite_link:
+                    groups_text += f"   🔗 {invite_link}\n"
+                groups_text += f"   📊 Auto: {group.get('quizzes_received', 0)} | Manual: {group.get('manual_quizzes_received', 0)}\n\n"
+                
+            except Exception as e:
+                # Group not accessible or bot removed
+                failed_groups.append(group_title)
+                all_links_text += f"{i}. 🔴 **{group_title}** (❌ Bot not in group)\n"
+                all_links_text += f"   • ID: `{chat_id}`\n"
+                all_links_text += f"   • Last active: {group.get('last_activity', 'Never')[:10]}\n\n"
+                
+                groups_text += f"{i}. 🔴 **{group_title}** (Bot removed)\n\n"
+                
+                # Mark as inactive
+                group['is_active'] = False
+                self.save_group(group)
+            
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.1)
+        
+        # Reload groups after updates
+        self.groups = self.load_groups()
+        
+        # Update loading message with summary
+        await loading_msg.delete()
+        
+        # Send summary first
+        summary_text = (
+            f"📊 **Groups Summary**\n\n"
+            f"✅ Successfully fetched links: {success_count}/{len(self.groups)}\n"
+            f"❌ Failed/Inaccessible: {len(failed_groups)}\n"
+            f"🟢 Active groups: {len(active_groups)}\n"
+            f"🔴 Inactive groups: {len(inactive_groups)}\n\n"
+        )
+        
+        if failed_groups:
+            summary_text += "❌ **Failed Groups (Bot not in group):**\n"
+            for group in failed_groups[:5]:  # Show only first 5
+                summary_text += f"• {group}\n"
+            if len(failed_groups) > 5:
+                summary_text += f"... and {len(failed_groups) - 5} more\n"
+            summary_text += "\n"
+        
+        # Add instructions
+        summary_text += (
+            "📝 **Note:** Links expire in 7 days\n"
+            "🔄 Use /refreshgroups to update group status\n"
+            "🗑️ Inactive groups are automatically cleaned"
+        )
+        
+        # Create inline keyboard for navigation
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_groups")],
+            [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
+            [InlineKeyboardButton("📊 All Group Stats", callback_data="manage_groups")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(summary_text, reply_markup=reply_markup)
+        
+        # Check if detailed list is too long for Telegram
+        if len(all_links_text) > 4000:
+            # Split into multiple messages
+            chunks = [all_links_text[i:i+4000] for i in range(0, len(all_links_text), 4000)]
+            for i, chunk in enumerate(chunks[:3]):  # Send max 3 chunks
+                if i == 0:
+                    await update.message.reply_text(chunk, parse_mode='Markdown')
+                else:
+                    await update.message.reply_text(f"... (continued)\n\n{chunk}", parse_mode='Markdown')
+                await asyncio.sleep(0.5)
+            
+            if len(chunks) > 3:
+                await update.message.reply_text(f"📝 And {len(chunks)-3} more parts... List truncated.")
+        else:
+            # Send complete list
+            await update.message.reply_text(all_links_text, parse_mode='Markdown')
+    
+    async def quick_groups_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /groups command - quick list of groups without links"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ This command is for admin only.")
+            return
+        
+        if not self.groups:
+            await update.message.reply_text("❌ No groups found in database.")
+            return
+        
+        active_groups = [g for g in self.groups if g.get('is_active', True)]
+        inactive_groups = [g for g in self.groups if not g.get('is_active', True)]
+        
+        groups_text = f"👥 **Groups Summary ({len(self.groups)} total)**\n\n"
+        
+        if active_groups:
+            groups_text += f"🟢 **Active Groups ({len(active_groups)})**\n"
+            for i, group in enumerate(active_groups[:20], 1):  # Show only first 20
+                groups_text += f"{i}. {group.get('title', 'Unknown')} (ID: `{group['chat_id']}`)\n"
+                groups_text += f"   📊 Auto: {group.get('quizzes_received', 0)} | Manual: {group.get('manual_quizzes_received', 0)}\n"
+            
+            if len(active_groups) > 20:
+                groups_text += f"... and {len(active_groups) - 20} more\n"
+            
+            groups_text += "\n"
+        
+        if inactive_groups:
+            groups_text += f"🔴 **Inactive Groups ({len(inactive_groups)})**\n"
+            for i, group in enumerate(inactive_groups[:10], 1):  # Show only first 10
+                groups_text += f"{i}. {group.get('title', 'Unknown')} (ID: `{group['chat_id']}`)\n"
+            
+            if len(inactive_groups) > 10:
+                groups_text += f"... and {len(inactive_groups) - 10} more\n"
+            
+            groups_text += "\n"
+        
+        groups_text += (
+            f"📊 **Stats:**\n"
+            f"• Total quizzes sent to all groups: {self.stats.get('total_quizzes_sent', 0)}\n"
+            f"• Manual quizzes sent: {self.stats.get('manual_quizzes_sent', 0)}\n"
+            f"• Active groups percentage: {(len(active_groups)/len(self.groups)*100 if self.groups else 0):.1f}%\n\n"
+            f"💡 Use `/grouplist` for detailed list with invite links\n"
+            f"💡 Use `/grouplinks` for only links (export format)"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔗 Get Links", callback_data="get_group_links")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="manage_groups")],
+            [InlineKeyboardButton("📊 Full Stats", callback_data="stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(groups_text, reply_markup=reply_markup)
+    
+    async def export_group_links(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /grouplinks command - export group links in simple format"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ This command is for admin only.")
+            return
+        
+        if not self.groups:
+            await update.message.reply_text("❌ No groups found in database.")
+            return
+        
+        loading_msg = await update.message.reply_text("🔄 Generating group links...")
+        
+        links_text = "🔗 **Group Invite Links**\n\n"
+        links_only = "📋 **Links Only (for export):**\n\n"
+        
+        success_count = 0
+        
+        for group in self.groups:
+            if not group.get('is_active', True):
+                continue
+                
+            chat_id = group['chat_id']
+            group_title = group.get('title', f"Group {chat_id}")
+            
+            try:
+                # Try to create invite link
+                try:
+                    invite_link_obj = await context.bot.create_chat_invite_link(
+                        chat_id=chat_id,
+                        member_limit=1,
+                        expire_date=datetime.now() + timedelta(days=7)
+                    )
+                    invite_link = invite_link_obj.invite_link
+                except:
+                    # Try to export existing link
+                    invite_link = await context.bot.export_chat_invite_link(chat_id)
+                
+                links_text += f"• **{group_title}**\n{invite_link}\n\n"
+                links_only += f"{invite_link}\n"
+                success_count += 1
+                
+            except Exception as e:
+                links_text += f"• **{group_title}** - ❌ No link available\n\n"
+            
+            await asyncio.sleep(0.1)
+        
+        await loading_msg.delete()
+        
+        summary = (
+            f"✅ **Group Links Export**\n\n"
+            f"📊 Generated {success_count} links from {len(self.groups)} groups\n"
+            f"⏰ Links expire in 7 days\n"
+            f"📋 Copy links from below section\n\n"
+            f"💡 **Tip:** Use `/grouplist` for detailed view\n"
+            f"💡 **Tip:** Use `/groups` for quick overview"
+        )
+        
+        await update.message.reply_text(summary)
+        
+        # Send links text (might be long)
+        if len(links_text) > 4000:
+            chunks = [links_text[i:i+4000] for i in range(0, len(links_text), 4000)]
+            for chunk in chunks[:3]:
+                await update.message.reply_text(chunk, parse_mode='Markdown')
+                await asyncio.sleep(0.5)
+        else:
+            await update.message.reply_text(links_text, parse_mode='Markdown')
+        
+        # Send links-only section
+        await update.message.reply_text("📋 **Copy-paste section:**")
+        if len(links_only) > 4000:
+            # Save to file if too long
+            with open('group_links.txt', 'w', encoding='utf-8') as f:
+                f.write(links_only)
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=open('group_links.txt', 'rb'),
+                filename='group_links.txt',
+                caption="📋 Group links (text file)"
+            )
+        else:
+            await update.message.reply_text(f"```\n{links_only}\n```", parse_mode='Markdown')
+    
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard button presses"""
         query = update.callback_query
@@ -1342,6 +1628,8 @@ class QuizBot:
             await self.reactivate_all_groups(update, context)
         elif data == "refresh_groups":
             await self.refresh_groups(update, context)
+        elif data == "get_group_links":
+            await self.export_group_links(update, context)
         elif data.startswith("remove_group_"):
             chat_id = int(data.split("_")[2])
             await self.remove_group(update, context, chat_id)
@@ -1402,6 +1690,11 @@ class QuizBot:
         self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
         self.application.add_handler(CommandHandler("reset", self.reset_quizzes_command))
         
+        # Add new group list commands
+        self.application.add_handler(CommandHandler("grouplist", self.list_groups_with_links))
+        self.application.add_handler(CommandHandler("groupslist", self.quick_groups_list))  # Alternative command
+        self.application.add_handler(CommandHandler("grouplinks", self.export_group_links))
+        
         # Handle both text messages and polls
         self.application.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & (filters.TEXT | filters.POLL) & ~filters.COMMAND, 
@@ -1441,6 +1734,9 @@ class QuizBot:
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
         print(f"🎯 /rquiz command enabled for group admins")
         print(f"🔄 /reset command available for admin")
+        print(f"👥 NEW: /grouplist command for detailed group list with invite links")
+        print(f"👥 NEW: /groupslist command for quick group overview")
+        print(f"👥 NEW: /grouplinks command for links export")
         print(f"🔄 IMPROVED Anti-repeat system active: Tracks last {self.max_recent_track} sent quizzes")
         print(f"👤 Quiz acceptance: Both anonymous and non-anonymous QUIZ MODE polls accepted")
         print(f"📤 Quiz sending: ALWAYS sends as NON-ANONYMOUS (voters visible)")
