@@ -158,7 +158,9 @@ class QuizBot:
                 'last_quiz_sent': None,
                 'group_engagement': {},
                 'total_broadcasts_sent': 0,
-                'manual_quizzes_sent': 0
+                'manual_quizzes_sent': 0,
+                'quiz_reports_received': 0,
+                'quizzes_deleted_by_reports': 0
             }
             self.mongo.insert_one('stats', stats)
         return stats
@@ -299,7 +301,8 @@ class QuizBot:
                     [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
                     [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
                     [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
-                    [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
+                    [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
+                    [InlineKeyboardButton("⚠️ View Reports", callback_data="view_reports")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
@@ -314,7 +317,8 @@ class QuizBot:
                     f"📢 **Broadcast** - Send message to all groups\n"
                     f"👥 **Manage Groups** - View and manage groups\n"
                     f"📋 **Export Data** - Export quizzes and stats\n"
-                    f"🔄 **Reset Quizzes** - Delete all saved quizzes\n\n"
+                    f"🔄 **Reset Quizzes** - Delete all saved quizzes\n"
+                    f"⚠️ **View Reports** - Check reported quizzes\n\n"
                     f"To add a quiz: Create a QUIZ MODE poll and send it to me!",
                     reply_markup=reply_markup
                 )
@@ -323,7 +327,8 @@ class QuizBot:
                     "👋 Hello! I'm a quiz bot that sends random quiz polls regularly.\n\n"
                     "Add me to your group and make me an admin to start receiving fun quiz polls!\n\n"
                     "⚡ **Group Commands:**\n"
-                    "• /rquiz - Send immediate random quiz (Group admins only)"
+                    "• /rquiz - Send immediate random quiz (Group admins only)\n"
+                    "• /qreport - Report a quiz for review (Reply to a quiz with this command)"
                 )
         else:
             # Bot added to a group
@@ -464,7 +469,8 @@ class QuizBot:
             f"👥 Will be sent to: {len(self.groups)} groups\n"
             f"⏰ Next quiz in: {self.quiz_interval / 3600} hours\n\n"
             f"💡 Note: When sent to groups, quizzes will always be NON-ANONYMOUS (voters visible)\n"
-            f"💡 Group admins can use /rquiz to send immediate quizzes!"
+            f"💡 Group admins can use /rquiz to send immediate quizzes!\n"
+            f"⚠️ Users can report quizzes with /qreport command"
         )
     
     async def send_random_quiz(self):
@@ -625,6 +631,461 @@ class QuizBot:
         except Exception as e:
             print(f"Error sending immediate quiz: {e}")
             await update.message.reply_text("❌ Failed to send quiz. Please try again later.")
+    
+    async def report_quiz_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /qreport command - report a quiz for review"""
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        message_id = update.effective_message.message_id
+        
+        # Check if it's a group chat
+        if update.effective_chat.type not in ['group', 'supergroup']:
+            await update.message.reply_text("❌ This command can only be used in groups!")
+            return
+        
+        # Check if the message is a reply to a quiz
+        if not update.message.reply_to_message or not update.message.reply_to_message.poll:
+            await update.message.reply_text(
+                "❌ Please reply to a quiz message with /qreport!\n\n"
+                "**Usage:**\n"
+                "1. Find a quiz poll sent by the bot\n"
+                "2. Reply to that quiz message\n"
+                "3. Send `/qreport`\n\n"
+                "The bot will forward the quiz to the admin for review."
+            )
+            return
+        
+        replied_poll = update.message.reply_to_message.poll
+        
+        # Check if it's a quiz mode poll (has correct_option_id)
+        if replied_poll.correct_option_id is None:
+            await update.message.reply_text("❌ This is not a quiz! Only quiz polls can be reported.")
+            return
+        
+        # Extract quiz information
+        quiz_info = {
+            'chat_id': chat_id,
+            'message_id': update.message.reply_to_message.message_id,
+            'question': replied_poll.question,
+            'options': [option.text for option in replied_poll.options],
+            'correct_option_id': replied_poll.correct_option_id,
+            'reported_by': {
+                'user_id': user_id,
+                'username': update.effective_user.username,
+                'first_name': update.effective_user.first_name,
+            },
+            'report_time': datetime.now().isoformat(),
+            'group_name': update.effective_chat.title,
+            'original_message_link': f"https://t.me/c/{str(chat_id)[4:]}/{update.message.reply_to_message.message_id}"
+        }
+        
+        # Generate a unique report ID
+        report_id = f"report_{chat_id}_{message_id}"
+        
+        # Save report to MongoDB
+        self.mongo.insert_one('quiz_reports', {
+            '_id': report_id,
+            'status': 'pending',  # pending, reviewed, deleted, ignored
+            **quiz_info
+        })
+        
+        # Update stats
+        self.stats['quiz_reports_received'] = self.stats.get('quiz_reports_received', 0) + 1
+        self.save_stats()
+        
+        # Send confirmation to the user
+        await update.message.reply_text(
+            f"✅ **Quiz Reported Successfully!**\n\n"
+            f"📝 **Question:** {replied_poll.question[:100]}...\n\n"
+            f"The quiz has been forwarded to the admin for review.\n"
+            f"Thank you for helping improve the quiz quality!"
+        )
+        
+        # Forward the quiz to admin with action buttons
+        await self.send_quiz_report_to_admin(context, quiz_info, report_id)
+    
+    async def send_quiz_report_to_admin(self, context: ContextTypes.DEFAULT_TYPE, quiz_info: dict, report_id: str):
+        """Send quiz report to admin with action buttons"""
+        
+        # Format quiz information
+        options_text = "\n".join([f"• {option}" for option in quiz_info['options']])
+        correct_answer = quiz_info['options'][quiz_info['correct_option_id']]
+        
+        # Handle username display
+        username = quiz_info['reported_by']['username']
+        username_display = f" (@{username})" if username else ""
+        
+        report_text = (
+            f"⚠️ **QUIZ REPORTED FOR REVIEW**\n\n"
+            f"📝 **Question:** {quiz_info['question']}\n\n"
+            f"📋 **Options:**\n{options_text}\n\n"
+            f"✅ **Correct Answer:** {correct_answer}\n\n"
+            f"📊 **Report Details:**\n"
+            f"• 👤 Reported by: {quiz_info['reported_by']['first_name']}{username_display}\n"
+            f"• 👥 Group: {quiz_info['group_name']}\n"
+            f"• 🕐 Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"• 🔗 Message: [View Original]({quiz_info['original_message_link']})\n\n"
+            f"**What would you like to do with this quiz?**"
+        )
+        
+        # Create action buttons
+        keyboard = [
+            [
+                InlineKeyboardButton("🗑️ Delete Quiz", callback_data=f"delete_quiz_{report_id}"),
+                InlineKeyboardButton("👁️ Ignore Report", callback_data=f"ignore_report_{report_id}")
+            ],
+            [
+                InlineKeyboardButton("📝 View Similar Quizzes", callback_data=f"view_similar_{report_id}"),
+                InlineKeyboardButton("📊 View All Reports", callback_data="view_reports")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send to admin
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=report_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    
+    async def handle_delete_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
+        """Handle delete quiz action from admin"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Get report details
+        report = self.mongo.find_one('quiz_reports', {'_id': report_id})
+        if not report:
+            await query.edit_message_text("❌ Report not found or already processed.")
+            return
+        
+        # Find and delete the quiz from database
+        deleted_count = 0
+        similar_quizzes = []
+        
+        # Find quizzes with similar question (case-insensitive partial match)
+        all_quizzes = self.mongo.find('quizzes', {})
+        for quiz in all_quizzes:
+            if quiz['question'].lower() == report['question'].lower():
+                # Exact match - delete
+                self.mongo.delete_one('quizzes', {'_id': quiz['_id']})
+                deleted_count += 1
+            elif report['question'].lower() in quiz['question'].lower() or quiz['question'].lower() in report['question'].lower():
+                # Partial match - add to similar list
+                similar_quizzes.append(quiz)
+        
+        # Update report status
+        self.mongo.update_one('quiz_reports', {'_id': report_id}, {
+            '$set': {
+                'status': 'deleted',
+                'action_taken': 'quiz_deleted',
+                'deleted_quizzes': deleted_count,
+                'action_time': datetime.now().isoformat()
+            }
+        })
+        
+        # Update stats
+        self.stats['quizzes_deleted_by_reports'] = self.stats.get('quizzes_deleted_by_reports', 0) + deleted_count
+        self.save_stats()
+        
+        # Reload quizzes
+        self.quizzes = self.load_quizzes()
+        
+        # Prepare response
+        response_text = (
+            f"✅ **Quiz Deleted Successfully!**\n\n"
+            f"🗑️ Deleted {deleted_count} quiz(es) with matching question:\n"
+            f"`{report['question'][:100]}...`\n\n"
+        )
+        
+        if similar_quizzes:
+            response_text += f"⚠️ Found {len(similar_quizzes)} similar quizzes:\n"
+            for i, quiz in enumerate(similar_quizzes[:5], 1):  # Show only first 5
+                response_text += f"{i}. {quiz['question'][:80]}...\n"
+            
+            if len(similar_quizzes) > 5:
+                response_text += f"... and {len(similar_quizzes) - 5} more\n"
+            
+            # Add option to delete all similar
+            keyboard = [
+                [InlineKeyboardButton("🗑️ Delete All Similar", callback_data=f"delete_similar_{report_id}")],
+                [InlineKeyboardButton("✅ Done", callback_data="close_report")]
+            ]
+        else:
+            keyboard = [[InlineKeyboardButton("✅ Done", callback_data="close_report")]]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(response_text, reply_markup=reply_markup)
+    
+    async def handle_delete_similar_quizzes(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
+        """Delete all similar quizzes"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Get report details
+        report = self.mongo.find_one('quiz_reports', {'_id': report_id})
+        if not report:
+            await query.edit_message_text("❌ Report not found.")
+            return
+        
+        # Find and delete all similar quizzes
+        deleted_count = 0
+        all_quizzes = self.mongo.find('quizzes', {})
+        
+        for quiz in all_quizzes:
+            # Check for similarity (partial match in either direction)
+            if (report['question'].lower() in quiz['question'].lower() or 
+                quiz['question'].lower() in report['question'].lower()):
+                self.mongo.delete_one('quizzes', {'_id': quiz['_id']})
+                deleted_count += 1
+        
+        # Update report
+        self.mongo.update_one('quiz_reports', {'_id': report_id}, {
+            '$set': {
+                'additional_deleted': deleted_count,
+                'total_deleted': report.get('deleted_quizzes', 0) + deleted_count,
+                'action_time': datetime.now().isoformat()
+            }
+        })
+        
+        # Update stats
+        self.stats['quizzes_deleted_by_reports'] = self.stats.get('quizzes_deleted_by_reports', 0) + deleted_count
+        self.save_stats()
+        
+        # Reload quizzes
+        self.quizzes = self.load_quizzes()
+        
+        response_text = (
+            f"✅ **All Similar Quizzes Deleted!**\n\n"
+            f"🗑️ Deleted {deleted_count} similar quizzes\n"
+            f"📝 Total deleted for this report: {report.get('deleted_quizzes', 0) + deleted_count}\n\n"
+            f"The quiz database has been cleaned."
+        )
+        
+        keyboard = [[InlineKeyboardButton("✅ Done", callback_data="close_report")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(response_text, reply_markup=reply_markup)
+    
+    async def handle_ignore_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
+        """Handle ignore report action"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Update report status
+        self.mongo.update_one('quiz_reports', {'_id': report_id}, {
+            '$set': {
+                'status': 'ignored',
+                'action_taken': 'ignored',
+                'action_time': datetime.now().isoformat()
+            }
+        })
+        
+        await query.edit_message_text(
+            "✅ **Report Ignored**\n\n"
+            "The quiz report has been marked as ignored.\n"
+            "No action was taken on the quiz.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Close", callback_data="close_report")]])
+        )
+    
+    async def handle_view_similar(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
+        """View similar quizzes in database"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Get report details
+        report = self.mongo.find_one('quiz_reports', {'_id': report_id})
+        if not report:
+            await query.edit_message_text("❌ Report not found.")
+            return
+        
+        # Find similar quizzes
+        similar_quizzes = []
+        for quiz in self.quizzes:
+            # Check for similarity
+            if (report['question'].lower() in quiz['question'].lower() or 
+                quiz['question'].lower() in report['question'].lower()):
+                similar_quizzes.append(quiz)
+        
+        if not similar_quizzes:
+            response_text = (
+                f"📝 **No Similar Quizzes Found**\n\n"
+                f"The reported question:\n`{report['question']}`\n\n"
+                f"Was not found in the database.\n"
+                f"It might have been already deleted or never saved."
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("🔙 Back to Report", callback_data=f"report_back_{report_id}")],
+                [InlineKeyboardButton("✅ Close", callback_data="close_report")]
+            ]
+        else:
+            response_text = f"📝 **Found {len(similar_quizzes)} Similar Quiz(es)**\n\n"
+            
+            for i, quiz in enumerate(similar_quizzes[:10], 1):  # Show only first 10
+                status = "✅ Active" if quiz.get('is_active', True) else "❌ Inactive"
+                sent_count = quiz.get('sent_count', 0)
+                manual_count = quiz.get('manual_sent_count', 0)
+                
+                response_text += (
+                    f"**{i}. {quiz['question'][:80]}...**\n"
+                    f"   Status: {status} | Auto: {sent_count} | Manual: {manual_count}\n"
+                    f"   ID: `{quiz['_id']}`\n\n"
+                )
+            
+            if len(similar_quizzes) > 10:
+                response_text += f"... and {len(similar_quizzes) - 10} more similar quizzes\n\n"
+            
+            response_text += "**Options:**"
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("🗑️ Delete All", callback_data=f"delete_similar_{report_id}"),
+                    InlineKeyboardButton("🗑️ Delete Only Exact", callback_data=f"delete_quiz_{report_id}")
+                ],
+                [
+                    InlineKeyboardButton("🔙 Back to Report", callback_data=f"report_back_{report_id}"),
+                    InlineKeyboardButton("✅ Close", callback_data="close_report")
+                ]
+            ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(response_text, reply_markup=reply_markup)
+    
+    async def handle_view_reports(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """View all pending quiz reports"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Get all pending reports
+        pending_reports = self.mongo.find('quiz_reports', {'status': 'pending'})
+        total_reports = self.mongo.find('quiz_reports', {})
+        
+        if not pending_reports:
+            response_text = (
+                f"📊 **Quiz Reports Dashboard**\n\n"
+                f"✅ No pending reports!\n\n"
+                f"📈 **Statistics:**\n"
+                f"• Total reports: {len(total_reports)}\n"
+                f"• Pending: 0\n"
+                f"• Resolved: {len([r for r in total_reports if r['status'] != 'pending'])}\n"
+            )
+            
+            keyboard = [[InlineKeyboardButton("✅ Close", callback_data="close_report")]]
+        else:
+            response_text = (
+                f"📊 **Quiz Reports Dashboard**\n\n"
+                f"⚠️ **Pending Reports: {len(pending_reports)}**\n\n"
+            )
+            
+            for i, report in enumerate(pending_reports[:5], 1):  # Show only first 5
+                report_time = datetime.fromisoformat(report['report_time']).strftime('%m/%d %H:%M')
+                response_text += (
+                    f"{i}. **{report['question'][:60]}...**\n"
+                    f"   👤 {report['reported_by']['first_name']} | "
+                    f"👥 {report['group_name']}\n"
+                    f"   🕐 {report_time} | "
+                    f"[View]({report['original_message_link']})\n"
+                    f"   [Review](callback:report_{report['_id']})\n\n"
+                )
+            
+            if len(pending_reports) > 5:
+                response_text += f"... and {len(pending_reports) - 5} more pending reports\n\n"
+            
+            response_text += f"📈 **Statistics:**\n"
+            response_text += f"• Total reports: {len(total_reports)}\n"
+            response_text += f"• Pending: {len(pending_reports)}\n"
+            response_text += f"• Resolved: {len(total_reports) - len(pending_reports)}\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="view_reports")],
+                [InlineKeyboardButton("🗑️ Clear All Resolved", callback_data="clear_resolved_reports")],
+                [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+                [InlineKeyboardButton("✅ Close", callback_data="close_report")]
+            ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(response_text, reply_markup=reply_markup)
+    
+    async def handle_clear_resolved_reports(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Clear all resolved reports"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Delete all non-pending reports
+        result = self.mongo.delete_many('quiz_reports', {'status': {'$ne': 'pending'}})
+        
+        deleted_count = result.deleted_count if result else 0
+        
+        await query.edit_message_text(
+            f"✅ **Resolved Reports Cleared**\n\n"
+            f"🗑️ Deleted {deleted_count} resolved reports.\n"
+            f"Only pending reports remain in the database.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 View Reports", callback_data="view_reports")]])
+        )
+    
+    async def handle_report_back(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
+        """Go back to report view"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Get report
+        report = self.mongo.find_one('quiz_reports', {'_id': report_id})
+        if not report:
+            await query.edit_message_text("Report not found.")
+            return
+        
+        # Recreate the original report message
+        options_text = "\n".join([f"• {option}" for option in report['options']])
+        correct_answer = report['options'][report['correct_option_id']]
+        
+        # Handle username display
+        username = report['reported_by']['username']
+        username_display = f" (@{username})" if username else ""
+        
+        report_text = (
+            f"⚠️ **QUIZ REPORTED FOR REVIEW**\n\n"
+            f"📝 **Question:** {report['question']}\n\n"
+            f"📋 **Options:**\n{options_text}\n\n"
+            f"✅ **Correct Answer:** {correct_answer}\n\n"
+            f"📊 **Report Details:**\n"
+            f"• 👤 Reported by: {report['reported_by']['first_name']}{username_display}\n"
+            f"• 👥 Group: {report['group_name']}\n"
+            f"• 🕐 Time: {datetime.fromisoformat(report['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"• 🔗 Message: [View Original]({report['original_message_link']})\n\n"
+            f"**What would you like to do with this quiz?**"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🗑️ Delete Quiz", callback_data=f"delete_quiz_{report_id}"),
+                InlineKeyboardButton("👁️ Ignore Report", callback_data=f"ignore_report_{report_id}")
+            ],
+            [
+                InlineKeyboardButton("📝 View Similar Quizzes", callback_data=f"view_similar_{report_id}"),
+                InlineKeyboardButton("📊 View All Reports", callback_data="view_reports")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(report_text, reply_markup=reply_markup)
+    
+    async def handle_close_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Close the report message"""
+        query = update.callback_query
+        await query.answer()
+        
+        await query.edit_message_text(
+            "✅ Report interface closed.\n"
+            "Use /start to access the main menu.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="start_menu")]])
+        )
+    
+    async def handle_start_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Go back to start menu"""
+        await self.start(update, context)
     
     async def reset_quizzes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset command to delete all quizzes"""
@@ -799,6 +1260,9 @@ class QuizBot:
         total_quizzes_sent = self.stats['total_quizzes_sent']
         quizzes_added = self.stats['quizzes_added']
         manual_quizzes_sent = self.stats.get('manual_quizzes_sent', 0)
+        quiz_reports_received = self.stats.get('quiz_reports_received', 0)
+        quizzes_deleted_by_reports = self.stats.get('quizzes_deleted_by_reports', 0)
+        
         active_groups_count = len([g for g in self.groups if g.get('is_active', True)])
         
         # Calculate active groups (active in last 7 days)
@@ -818,7 +1282,8 @@ class QuizBot:
             f"📝 **Quizzes Database**\n"
             f"   • Total quizzes: {total_quizzes}\n"
             f"   • Quizzes added: {quizzes_added}\n"
-            f"   • Most sent quiz: {most_sent['sent_count'] if most_sent else 0} times\n\n"
+            f"   • Most sent quiz: {most_sent['sent_count'] if most_sent else 0} times\n"
+            f"   • Quizzes deleted by reports: {quizzes_deleted_by_reports}\n\n"
             
             f"👥 **Groups Analytics**\n"
             f"   • Total groups: {total_groups}\n"
@@ -826,6 +1291,11 @@ class QuizBot:
             f"   • Recently active: {recently_active}\n"
             f"   • Total quizzes sent: {total_quizzes_sent}\n"
             f"   • Manual quizzes sent: {manual_quizzes_sent}\n\n"
+            
+            f"⚠️ **Quiz Reports**\n"
+            f"   • Reports received: {quiz_reports_received}\n"
+            f"   • Pending reports: {len(self.mongo.find('quiz_reports', {'status': 'pending'}))}\n"
+            f"   • Resolved reports: {len(self.mongo.find('quiz_reports', {'status': {'$ne': 'pending'}}))}\n\n"
             
             f"⏰ **Performance**\n"
             f"   • Bot started: {datetime.fromisoformat(self.stats['bot_start_time']).strftime('%Y-%m-%d %H:%M')}\n"
@@ -843,7 +1313,8 @@ class QuizBot:
             [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
-            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
+            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
+            [InlineKeyboardButton("⚠️ View Reports", callback_data="view_reports")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -873,10 +1344,12 @@ class QuizBot:
             f"   - Data persistence status\n\n"
             f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
             f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n"
-            f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n\n"
+            f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n"
+            f"⚠️ **Quiz Reports**: {self.stats.get('quiz_reports_received', 0)}\n\n"
             f"💡 Use /setdelay <time> to change the quiz interval\n"
             f"💡 Use /setexplanation to change quiz explanation\n"
-            f"💡 Group admins can use /rquiz for immediate quizzes"
+            f"💡 Group admins can use /rquiz for immediate quizzes\n"
+            f"⚠️ Users can report quizzes with /qreport"
         )
         
         keyboard = [
@@ -885,6 +1358,7 @@ class QuizBot:
             [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
             [InlineKeyboardButton("🔄 Refresh Groups", callback_data="refresh_groups")],
             [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+            [InlineKeyboardButton("⚠️ View Reports", callback_data="view_reports")],
             [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1164,13 +1638,34 @@ class QuizBot:
                 caption="📊 Statistics Export (JSON)"
             )
             
+            # Export reports to CSV
+            reports = self.mongo.find('quiz_reports', {})
+            if reports:
+                with open('reports_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
+                    fieldnames = ['_id', 'status', 'question', 'options', 'correct_option_id', 'reported_by', 'report_time', 'group_name', 'action_taken', 'action_time']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for report in reports:
+                        report_export = report.copy()
+                        report_export['options'] = ' | '.join(report['options'])
+                        report_export['reported_by'] = f"{report['reported_by']['first_name']} ({report['reported_by']['user_id']})"
+                        writer.writerow(report_export)
+                
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=open('reports_export.csv', 'rb'),
+                    filename='reports_export.csv',
+                    caption="⚠️ Quiz Reports Export (CSV)"
+                )
+            
             # Send summary
             summary = (
                 f"✅ **Data Export Completed**\n\n"
                 f"📁 Files exported:\n"
                 f"• quizzes_export.csv ({len(self.quizzes)} quizzes)\n"
                 f"• groups_export.csv ({len(self.groups)} groups)\n"
-                f"• stats_export.json (statistics)\n\n"
+                f"• stats_export.json (statistics)\n"
+                f"• reports_export.csv ({len(reports)} reports)\n\n"
                 f"💾 All data has been exported successfully!"
             )
             
@@ -1600,7 +2095,8 @@ class QuizBot:
                 "📢 **Important:** I accept both anonymous and non-anonymous QUIZ MODE polls\n"
                 "📢 **Important:** When sent to groups, quizzes will ALWAYS be NON-ANONYMOUS (voters visible)\n\n"
                 "I'll automatically save it and send it to groups!\n\n"
-                "💡 Group admins can use /rquiz for immediate quizzes"
+                "💡 Group admins can use /rquiz for immediate quizzes\n"
+                "⚠️ Users can report quizzes with /qreport"
             )
         elif data == "settings":
             await self.show_settings(update, context)
@@ -1636,6 +2132,29 @@ class QuizBot:
         elif data.startswith("group_stats_"):
             chat_id = int(data.split("_")[2])
             await self.show_group_stats(update, context, chat_id)
+        elif data.startswith("delete_quiz_"):
+            report_id = data[12:]  # Remove "delete_quiz_" prefix
+            await self.handle_delete_quiz(update, context, report_id)
+        elif data.startswith("delete_similar_"):
+            report_id = data[15:]  # Remove "delete_similar_" prefix
+            await self.handle_delete_similar_quizzes(update, context, report_id)
+        elif data.startswith("ignore_report_"):
+            report_id = data[14:]  # Remove "ignore_report_" prefix
+            await self.handle_ignore_report(update, context, report_id)
+        elif data.startswith("view_similar_"):
+            report_id = data[13:]  # Remove "view_similar_" prefix
+            await self.handle_view_similar(update, context, report_id)
+        elif data == "view_reports":
+            await self.handle_view_reports(update, context)
+        elif data == "clear_resolved_reports":
+            await self.handle_clear_resolved_reports(update, context)
+        elif data.startswith("report_back_"):
+            report_id = data[12:]  # Remove "report_back_" prefix
+            await self.handle_report_back(update, context, report_id)
+        elif data == "close_report":
+            await self.handle_close_report(update, context)
+        elif data == "start_menu":
+            await self.handle_start_menu(update, context)
     
     async def remove_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         """Remove a group from the list"""
@@ -1689,6 +2208,7 @@ class QuizBot:
         self.application.add_handler(CommandHandler("setexplanation", self.set_explanation_command))
         self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
         self.application.add_handler(CommandHandler("reset", self.reset_quizzes_command))
+        self.application.add_handler(CommandHandler("qreport", self.report_quiz_command))
         
         # Add new group list commands
         self.application.add_handler(CommandHandler("grouplist", self.list_groups_with_links))
@@ -1737,9 +2257,11 @@ class QuizBot:
         print(f"👥 NEW: /grouplist command for detailed group list with invite links")
         print(f"👥 NEW: /groupslist command for quick group overview")
         print(f"👥 NEW: /grouplinks command for links export")
+        print(f"⚠️ NEW: /qreport command for users to report quizzes")
         print(f"🔄 IMPROVED Anti-repeat system active: Tracks last {self.max_recent_track} sent quizzes")
         print(f"👤 Quiz acceptance: Both anonymous and non-anonymous QUIZ MODE polls accepted")
         print(f"📤 Quiz sending: ALWAYS sends as NON-ANONYMOUS (voters visible)")
+        print(f"👮 Quiz moderation system active - reports go to admin DM")
         
         # Keep the bot running
         while True:
