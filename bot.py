@@ -776,25 +776,26 @@ class QuizBot:
             'deleted': 'Deleted'
         }.get(report.get('status'), 'Unknown')
         
+        # Use HTML formatting to avoid Markdown parsing errors
         report_text = (
-            f"📋 **Report Details**\n\n"
-            f"📝 **Question:** {report['question']}\n\n"
-            f"📋 **Options:**\n{options_text}\n\n"
-            f"✅ **Correct Answer:** {correct_answer}\n\n"
-            f"📊 **Report Information:**\n"
+            f"📋 <b>Report Details</b>\n\n"
+            f"📝 <b>Question:</b> {report['question']}\n\n"
+            f"📋 <b>Options:</b>\n{options_text}\n\n"
+            f"✅ <b>Correct Answer:</b> {correct_answer}\n\n"
+            f"📊 <b>Report Information:</b>\n"
             f"• 👤 Reported by: {report['reported_by']['first_name']}{username_display}\n"
             f"• 👥 Group: {report['group_name']}\n"
             f"• 🕐 Time: {datetime.fromisoformat(report['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"• 📊 Status: {status_emoji} {status_text}\n"
-            f"• 🔗 Message: [View Original]({report['original_message_link']})\n\n"
+            f"• 🔗 Message: <a href='{report['original_message_link']}'>View Original</a>\n\n"
         )
         
         # Add action taken info if available
         if report.get('action_taken'):
             action_time = datetime.fromisoformat(report.get('action_time', report['report_time'])).strftime('%Y-%m-%d %H:%M:%S')
-            report_text += f"⚡ **Action Taken:** {report.get('action_taken', 'None')} at {action_time}\n\n"
+            report_text += f"⚡ <b>Action Taken:</b> {report.get('action_taken', 'None')} at {action_time}\n\n"
         
-        report_text += "**What would you like to do with this quiz?**"
+        report_text += "<b>What would you like to do with this quiz?</b>"
         
         # Create action buttons based on status
         if report.get('status') == 'pending':
@@ -820,9 +821,17 @@ class QuizBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.edit_message_text(report_text, reply_markup=reply_markup, parse_mode='Markdown')
+            await update.callback_query.edit_message_text(
+                report_text, 
+                reply_markup=reply_markup, 
+                parse_mode='HTML'  # Changed to HTML
+            )
         else:
-            await update.message.reply_text(report_text, reply_markup=reply_markup, parse_mode='Markdown')
+            await update.message.reply_text(
+                report_text, 
+                reply_markup=reply_markup, 
+                parse_mode='HTML'  # Changed to HTML
+            )
     
     async def send_quiz_report_to_admin(self, context: ContextTypes.DEFAULT_TYPE, quiz_info: dict, report_id: str):
         """Send quiz report to admin with action buttons"""
@@ -835,17 +844,18 @@ class QuizBot:
         username = quiz_info['reported_by']['username']
         username_display = f" (@{username})" if username else ""
         
+        # Use HTML formatting instead of Markdown to avoid parsing errors
         report_text = (
-            f"⚠️ **QUIZ REPORTED FOR REVIEW**\n\n"
-            f"📝 **Question:** {quiz_info['question']}\n\n"
-            f"📋 **Options:**\n{options_text}\n\n"
-            f"✅ **Correct Answer:** {correct_answer}\n\n"
-            f"📊 **Report Details:**\n"
+            f"⚠️ <b>QUIZ REPORTED FOR REVIEW</b>\n\n"
+            f"📝 <b>Question:</b> {quiz_info['question']}\n\n"
+            f"📋 <b>Options:</b>\n{options_text}\n\n"
+            f"✅ <b>Correct Answer:</b> {correct_answer}\n\n"
+            f"📊 <b>Report Details:</b>\n"
             f"• 👤 Reported by: {quiz_info['reported_by']['first_name']}{username_display}\n"
             f"• 👥 Group: {quiz_info['group_name']}\n"
             f"• 🕐 Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"• 🔗 Message: [View Original]({quiz_info['original_message_link']})\n\n"
-            f"**What would you like to do with this quiz?**"
+            f"• 🔗 Message: <a href='{quiz_info['original_message_link']}'>View Original</a>\n\n"
+            f"<b>What would you like to do with this quiz?</b>"
         )
         
         # Create action buttons
@@ -862,13 +872,33 @@ class QuizBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Send to admin
-        await context.bot.send_message(
-            chat_id=ADMIN_USER_ID,
-            text=report_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+        # Send to admin with HTML parse mode
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=report_text,
+                reply_markup=reply_markup,
+                parse_mode='HTML'  # Changed from 'Markdown' to 'HTML'
+            )
+            print(f"✅ Report sent to admin: {report_id}")
+        except Exception as e:
+            print(f"❌ Error sending report to admin: {e}")
+            # Try sending a simplified version without HTML if HTML fails
+            try:
+                simple_text = (
+                    f"⚠️ QUIZ REPORTED FOR REVIEW\n\n"
+                    f"Question: {quiz_info['question'][:200]}...\n\n"
+                    f"Reported by: {quiz_info['reported_by']['first_name']} in {quiz_info['group_name']}\n"
+                    f"Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Use /view {report_id} to view full details"
+                )
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=simple_text,
+                    reply_markup=reply_markup
+                )
+            except Exception as e2:
+                print(f"❌ Failed to send even simple report: {e2}")
     
     async def handle_delete_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
         """Handle delete quiz action from admin"""
@@ -2307,6 +2337,31 @@ class QuizBot:
         
         await update.callback_query.edit_message_text(stats_text, reply_markup=reply_markup)
     
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors in the bot"""
+        try:
+            raise context.error
+        except Exception as e:
+            print(f"⚠️ Bot error: {type(e).__name__}: {e}")
+            
+            # Log the full error for debugging
+            import traceback
+            traceback.print_exc()
+            
+            # If it's a parsing error, try to send a simplified message
+            if "Can't parse entities" in str(e):
+                print("⚠️ Markdown/HTML parsing error detected")
+                # Try to send a fallback message to admin if this was a report
+                try:
+                    if update and update.effective_chat and update.effective_chat.id == ADMIN_USER_ID:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_USER_ID,
+                            text="⚠️ A quiz report failed to send due to formatting issues. Please check the bot logs."
+                        )
+                except:
+                    pass
+        return
+    
     def setup_handlers(self):
         """Setup bot handlers"""
         self.application.add_handler(CommandHandler("start", self.start))
@@ -2340,6 +2395,9 @@ class QuizBot:
         ))
         
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
+        
+        # Add error handler
+        self.application.add_error_handler(self.error_handler)
     
     async def start_scheduler(self):
         """Start the quiz scheduler"""
@@ -2380,6 +2438,7 @@ class QuizBot:
         print(f"📤 Quiz sending: ALWAYS sends as NON-ANONYMOUS (voters visible)")
         print(f"👮 Quiz moderation system active - reports go to admin DM")
         print(f"🔒 Security: Bot will NOT send quizzes to admin's private chat")
+        print(f"🛡️ Error handler installed to catch parsing errors")
         
         # Keep the bot running
         while True:
