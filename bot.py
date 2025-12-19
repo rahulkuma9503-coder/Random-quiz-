@@ -555,7 +555,8 @@ class QuizBot:
                 type=Poll.QUIZ,  # Always QUIZ mode
                 correct_option_id=quiz['correct_option_id'],
                 explanation=explanation,
-                open_period=0,  # No time limit
+                open_period=0,  # No time limit,
+                protect_content=False  # Allow forwarding
             )
         
         # Update group stats
@@ -715,16 +716,38 @@ class QuizBot:
         self.stats['quiz_reports_received'] = self.stats.get('quiz_reports_received', 0) + 1
         self.save_stats()
         
-        # Send confirmation to the user
-        await update.message.reply_text(
-            f"✅ **Quiz Reported Successfully!**\n\n"
-            f"📝 **Question:** {replied_poll.question[:100]}...\n\n"
-            f"The quiz has been forwarded to the admin for review.\n"
-            f"Thank you for helping improve the quiz quality!"
-        )
+        # Send confirmation to the user (with self-destruct notice)
+        try:
+            confirmation_msg = await update.message.reply_text(
+                f"✅ **Quiz Reported Successfully!**\n\n"
+                f"📝 **Question:** {replied_poll.question[:100]}...\n\n"
+                f"The quiz has been forwarded to the admin for review.\n"
+                f"Thank you for helping improve the quiz quality!\n\n"
+                f"⏰ _This confirmation will self-destruct in 10 seconds..._"
+            )
+            
+            # Delete the confirmation after 10 seconds to avoid message clutter
+            asyncio.create_task(self.delete_message_after_delay(chat_id, confirmation_msg.message_id, 10))
+        except Exception as e:
+            print(f"⚠️ Could not send confirmation message (might be deleted): {e}")
+            # Continue anyway - the report is already saved
         
-        # Forward the quiz to admin with action buttons
-        await self.send_quiz_report_to_admin(context, quiz_info, report_id)
+        # Send the report to admin (this is the critical part)
+        try:
+            await self.send_quiz_report_to_admin(context, quiz_info, report_id)
+        except Exception as e:
+            print(f"❌ Error sending report to admin: {e}")
+            # Log the error but don't show to user to avoid confusion
+    
+    async def delete_message_after_delay(self, chat_id: int, message_id: int, delay_seconds: int):
+        """Delete a message after a delay"""
+        try:
+            await asyncio.sleep(delay_seconds)
+            await self.application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            print(f"🗑️ Auto-deleted message {message_id} in chat {chat_id}")
+        except Exception as e:
+            # Message might have already been deleted by group settings or bot doesn't have permission
+            print(f"⚠️ Could not delete message {message_id} in chat {chat_id}: {e}")
     
     async def view_report_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /view command - view a specific report by ID"""
@@ -787,7 +810,8 @@ class QuizBot:
             f"• 👥 Group: {report['group_name']}\n"
             f"• 🕐 Time: {datetime.fromisoformat(report['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"• 📊 Status: {status_emoji} {status_text}\n"
-            f"• 🔗 Message: <a href='{report['original_message_link']}'>View Original</a>\n\n"
+            f"• 🔗 Message: <a href='{report['original_message_link']}'>View Original</a>\n"
+            f"• 🆔 Report ID: <code>{report['_id']}</code>\n\n"
         )
         
         # Add action taken info if available
@@ -824,13 +848,13 @@ class QuizBot:
             await update.callback_query.edit_message_text(
                 report_text, 
                 reply_markup=reply_markup, 
-                parse_mode='HTML'  # Changed to HTML
+                parse_mode='HTML'
             )
         else:
             await update.message.reply_text(
                 report_text, 
                 reply_markup=reply_markup, 
-                parse_mode='HTML'  # Changed to HTML
+                parse_mode='HTML'
             )
     
     async def send_quiz_report_to_admin(self, context: ContextTypes.DEFAULT_TYPE, quiz_info: dict, report_id: str):
@@ -854,7 +878,8 @@ class QuizBot:
             f"• 👤 Reported by: {quiz_info['reported_by']['first_name']}{username_display}\n"
             f"• 👥 Group: {quiz_info['group_name']}\n"
             f"• 🕐 Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"• 🔗 Message: <a href='{quiz_info['original_message_link']}'>View Original</a>\n\n"
+            f"• 🔗 Message: <a href='{quiz_info['original_message_link']}'>View Original</a>\n"
+            f"• 🆔 Report ID: <code>{report_id}</code>\n\n"
             f"<b>What would you like to do with this quiz?</b>"
         )
         
@@ -878,18 +903,19 @@ class QuizBot:
                 chat_id=ADMIN_USER_ID,
                 text=report_text,
                 reply_markup=reply_markup,
-                parse_mode='HTML'  # Changed from 'Markdown' to 'HTML'
+                parse_mode='HTML'
             )
             print(f"✅ Report sent to admin: {report_id}")
         except Exception as e:
             print(f"❌ Error sending report to admin: {e}")
-            # Try sending a simplified version without HTML if HTML fails
+            # Try sending a simplified version without HTML
             try:
                 simple_text = (
                     f"⚠️ QUIZ REPORTED FOR REVIEW\n\n"
                     f"Question: {quiz_info['question'][:200]}...\n\n"
                     f"Reported by: {quiz_info['reported_by']['first_name']} in {quiz_info['group_name']}\n"
-                    f"Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Time: {datetime.fromisoformat(quiz_info['report_time']).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Report ID: {report_id}\n\n"
                     f"Use /view {report_id} to view full details"
                 )
                 await context.bot.send_message(
@@ -899,6 +925,11 @@ class QuizBot:
                 )
             except Exception as e2:
                 print(f"❌ Failed to send even simple report: {e2}")
+                # Last resort: log to console
+                print(f"📋 QUIZ REPORT (Not sent to admin): {report_id}")
+                print(f"Question: {quiz_info['question']}")
+                print(f"Reported by: {quiz_info['reported_by']['first_name']}")
+                print(f"Group: {quiz_info['group_name']}")
     
     async def handle_delete_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE, report_id: str):
         """Handle delete quiz action from admin"""
@@ -2439,6 +2470,8 @@ class QuizBot:
         print(f"👮 Quiz moderation system active - reports go to admin DM")
         print(f"🔒 Security: Bot will NOT send quizzes to admin's private chat")
         print(f"🛡️ Error handler installed to catch parsing errors")
+        print(f"🗑️ Report confirmations auto-delete after 10 seconds to avoid message clutter")
+        print(f"📨 Reports to admin now include Report ID for easy reference")
         
         # Keep the bot running
         while True:
